@@ -26,6 +26,22 @@ import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialo
 const DEBUG_GOTO = false;  // Set to true to see goto/patrol step logging
 
 const getLeaderboard = () => { try { return JSON.parse(localStorage.getItem('scLeaderboard') || '{}'); } catch { return {}; } };
+
+// Calculate patrol segment distances using real pathfinding
+// Returns { segs: number[], returnDist: number, subtotal: number, total: number }
+function calcPatrolDists(waypoints, unit, state) {
+  if (!waypoints || waypoints.length < 2 || !unit || !state) return null;
+  const segs = [];
+  for (let i = 0; i < waypoints.length - 1; i++) {
+    const p = findPath(waypoints[i].x, waypoints[i].y, waypoints[i + 1].x, waypoints[i + 1].y, unit, state);
+    segs.push(p ? p.length : 0);
+  }
+  const last = waypoints[waypoints.length - 1];
+  const ret = findPath(last.x, last.y, waypoints[0].x, waypoints[0].y, unit, state);
+  const returnDist = ret ? ret.length : 0;
+  const subtotal = segs.reduce((a, b) => a + b, 0);
+  return { segs, returnDist, subtotal, total: subtotal + returnDist };
+}
 const saveToLeaderboard = (mapSize, difficulty, turns) => { try { const lb = getLeaderboard(), key = `${mapSize}-${difficulty}`; if (!lb[key]) lb[key] = []; lb[key].push({ turns, date: new Date().toLocaleDateString() }); lb[key].sort((a, b) => a.turns - b.turns); lb[key] = lb[key].slice(0, 3); localStorage.setItem('scLeaderboard', JSON.stringify(lb)); } catch {} };
 const getTopScores = (mapSize, difficulty) => getLeaderboard()[`${mapSize}-${difficulty}`] || [];
 
@@ -203,7 +219,7 @@ export default function StrategicConquestGame() {
   const [viewportX, setViewportX] = useState(0), [viewportY, setViewportY] = useState(0);
   const [message, setMessage] = useState('Your turn. Select a unit to move.');
   const [blink, setBlink] = useState(false);
-  const [gotoMode, setGotoMode] = useState(false), [patrolMode, setPatrolMode] = useState(false), [patrolWaypoints, setPatrolWaypoints] = useState([]);
+  const [gotoMode, setGotoMode] = useState(false), [patrolMode, setPatrolMode] = useState(false), [patrolWaypoints, setPatrolWaypoints] = useState([]), [patrolDistances, setPatrolDistances] = useState(null);
   const [bombardMode, setBombardMode] = useState(false); // NEW: Bombardment mode for battleships
   const [dragging, setDragging] = useState(false), [dragTarget, setDragTarget] = useState(null);
   // BUG #8 FIX: Add hoverTarget state for gotoMode preview
@@ -1370,9 +1386,10 @@ export default function StrategicConquestGame() {
           setHoverTarget(null);
           setMessage(gotoMode ? 'GoTo cancelled.' : 'GoTo mode: click destination.'); 
           break;
-        case 'p': 
+        case 'p':
           // PATROL FIX: If already in patrol mode with 2+ waypoints, show confirm dialog
           if (patrolMode && patrolWaypoints.length >= 2) {
+            setPatrolDistances(calcPatrolDists(patrolWaypoints, activeUnit, gameState));
             setShowPatrolConfirm(true);
             return;
           }
@@ -1423,9 +1440,10 @@ export default function StrategicConquestGame() {
         case 'c': setShowCityList(true); break;
         case 'v': setShowAllUnits(true); break;
         case 'a': if (aiObservations.length > 0) setShowAiSummary(true); break;
-        case 'enter': 
+        case 'enter':
           // PATROL FIX: Enter in patrol mode with 2+ waypoints confirms patrol
           if (patrolMode && patrolWaypoints.length >= 2) {
+            setPatrolDistances(calcPatrolDists(patrolWaypoints, activeUnit, gameState));
             setShowPatrolConfirm(true);
             return;
           }
@@ -1495,38 +1513,20 @@ export default function StrategicConquestGame() {
       return; 
     }
     
-    if (patrolMode) { 
+    if (patrolMode) {
       const newWaypoints = [...patrolWaypoints, { x, y }];
       setPatrolWaypoints(newWaypoints);
-      
-      // BUG #4 FIX: Calculate and show route details as waypoints are added
-      if (activeUnit && newWaypoints.length >= 1) {
-        // Calculate total patrol route distance
-        let totalDist = 0;
+
+      if (activeUnit && newWaypoints.length >= 2) {
         const spec = UNIT_SPECS[activeUnit.type];
-        
-        // Distance from unit to first waypoint
-        const pathToFirst = findPath(activeUnit.x, activeUnit.y, newWaypoints[0].x, newWaypoints[0].y, activeUnit, gameState);
-        if (pathToFirst) totalDist += pathToFirst.length;
-        
-        // Distance between consecutive waypoints (including back to start for loop)
-        for (let i = 0; i < newWaypoints.length; i++) {
-          const from = newWaypoints[i];
-          const to = newWaypoints[(i + 1) % newWaypoints.length];
-          const segPath = findPath(from.x, from.y, to.x, to.y, activeUnit, gameState);
-          if (segPath) totalDist += segPath.length;
-        }
-        
-        const estimatedTurns = Math.ceil(totalDist / spec.movement);
-        const waypointList = newWaypoints.map((w, i) => `W${i+1}(${w.x},${w.y})`).join(' -> ');
-        
-        if (newWaypoints.length === 1) {
-          setMessage(`Patrol: ${waypointList} | ${totalDist} tiles, ~${estimatedTurns} turns/loop. Add more waypoints or press P/Enter to confirm.`);
-        } else {
-          setMessage(`Patrol: ${waypointList} -> W1 | ${totalDist} tiles, ~${estimatedTurns} turns/loop. Press P/Enter to confirm.`);
+        const dists = calcPatrolDists(newWaypoints, activeUnit, gameState);
+        if (dists) {
+          const segStr = dists.segs.map((d, i) => `WP${i}→WP${i+1}:${d}`).join(', ');
+          const estimatedTurns = Math.ceil(dists.total / spec.movement);
+          setMessage(`${segStr} | sub:${dists.subtotal} +ret:${dists.returnDist}=Total:${dists.total} (~${estimatedTurns}t). P/Enter to confirm.`);
         }
       }
-      return; 
+      return;
     }
     
     if (activeUnit && activeUnit.movesLeft > 0) {
@@ -1667,7 +1667,7 @@ export default function StrategicConquestGame() {
         <CommandMenu 
           activeUnit={activeUnit} 
           onCommand={cmd => { 
-            const map = { wait: 'w', skip: 'k', sentry: 's', goto: 'g', patrol: 'p', unload: 'u', bombard: 'b' }; 
+            const map = { wait: 'w', skip: 'k', next: 'n', sentry: 's', goto: 'g', patrol: 'p', unload: 'u', bombard: 'b' };
             if (map[cmd]) window.dispatchEvent(new KeyboardEvent('keydown', { key: map[cmd] })); 
           }} 
           disabled={!activeUnit || !!autoMovingUnitId} 
@@ -1762,7 +1762,7 @@ export default function StrategicConquestGame() {
       {showUnitView && <UnitViewDialog x={showUnitView.x} y={showUnitView.y} map={gameState.map} width={gameState.width} height={gameState.height} units={gameState.units} fogArray={fog} onClose={() => setShowUnitView(null)} onMakeActive={handleMakeActive} />}
       {showCityList && <CityListDialog cities={gameState.cities} units={gameState.units} onClose={() => setShowCityList(false)} onSelectCity={handleSelectCity} />}
       {showAllUnits && <AllUnitsListDialog units={gameState.units} map={gameState.map} width={gameState.width} height={gameState.height} fogArray={fog} onClose={() => setShowAllUnits(false)} onSelectUnit={handleSelectUnit} onMakeActive={handleMakeActive} />}
-      {showPatrolConfirm && <PatrolConfirmDialog waypoints={patrolWaypoints} onConfirm={handleConfirmPatrol} onCancel={() => { setShowPatrolConfirm(false); setPatrolMode(false); setPatrolWaypoints([]); }} />}
+      {showPatrolConfirm && <PatrolConfirmDialog waypoints={patrolWaypoints} segmentDistances={patrolDistances} onConfirm={handleConfirmPatrol} onCancel={() => { setShowPatrolConfirm(false); setPatrolMode(false); setPatrolWaypoints([]); setPatrolDistances(null); }} />}
       {showAiSummary && (aiObservations.length > 0 || aiCombatEvents.length > 0) && (
         <AITurnSummaryDialog 
           observations={aiObservations}

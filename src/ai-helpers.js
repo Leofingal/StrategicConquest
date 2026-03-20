@@ -241,7 +241,7 @@ export function clearPathCache() {
  * 1. Greedy best adjacent tile (original behavior) if A* fails
  * 2. Any valid adjacent tile if greedy also fails (prevents wasting all moves)
  */
-export function getMoveToward(unit, target, state) {
+export function getMoveToward(unit, target, state, avoidTiles = null) {
   const spec = UNIT_SPECS[unit.type];
   const { map, width, height, units, cities } = state;
 
@@ -266,14 +266,17 @@ export function getMoveToward(unit, target, state) {
   }
 
   // === STRATEGY 1: A* pathfinding (cached) ===
-  const cacheKey = `${unit.id}->${target.x},${target.y}`;
+  // Cache key includes avoidance flag — danger zones change each turn so avoided paths
+  // must not be reused for non-avoided movement and vice versa.
+  const cacheKey = `${unit.id}->${target.x},${target.y}${avoidTiles ? ':avoid' : ''}`;
   let path = _pathCache.get(cacheKey);
 
   if (!path) {
-    // Compute A* path (cap search distance to avoid huge computations on large maps)
     const maxDist = Math.min(200, width + height);
-    // findPath needs a unit with owner set for isFriendlyCity checks
-    path = findPath(unit.x, unit.y, target.x, target.y, unit, state, maxDist);
+    const tileCostFn = avoidTiles
+      ? (x, y) => (avoidTiles.has(`${x},${y}`) ? 20 : 1)
+      : null;
+    path = findPath(unit.x, unit.y, target.x, target.y, unit, state, maxDist, tileCostFn);
     if (path && path.length > 0) {
       _pathCache.set(cacheKey, path);
     }
@@ -312,10 +315,19 @@ export function getMoveToward(unit, target, state) {
   for (const [dx, dy] of ALL_DIRS) {
     const nx = unit.x + dx, ny = unit.y + dy;
     if (!isValidStep(nx, ny)) continue;
-
     validMoves.push({ x: nx, y: ny });
-    const dist = manhattanDistance(nx, ny, target.x, target.y);
-    if (dist < bestDist) { bestDist = dist; bestMove = { x: nx, y: ny }; }
+  }
+
+  // Prefer safe tiles when avoidance is active; fall back to any valid tile if all are dangerous
+  const preferredMoves = avoidTiles
+    ? (validMoves.filter(m => !avoidTiles.has(`${m.x},${m.y}`)).length > 0
+        ? validMoves.filter(m => !avoidTiles.has(`${m.x},${m.y}`))
+        : validMoves)
+    : validMoves;
+
+  for (const m of preferredMoves) {
+    const dist = manhattanDistance(m.x, m.y, target.x, target.y);
+    if (dist < bestDist) { bestDist = dist; bestMove = m; }
   }
 
   if (bestMove) return bestMove;
@@ -461,7 +473,15 @@ export function evaluateCombat(attacker, defender, gameState) {
     }, 0);
     attackerValue += cargoValue;
   }
-  const defenderValue = defSpec.productionDays * defender.strength / defSpec.strength;
+  // Defender value includes any cargo aboard (e.g. transport full of tanks)
+  let defenderValue = defSpec.productionDays * defender.strength / defSpec.strength;
+  const defCargo = gameState.units.filter(u => u.aboardId === defender.id);
+  if (defCargo.length > 0) {
+    defenderValue += defCargo.reduce((sum, u) => {
+      const cSpec = UNIT_SPECS[u.type];
+      return sum + (cSpec ? cSpec.productionDays : 0);
+    }, 0);
+  }
 
   let shouldAttack = false, reason = '';
 
@@ -503,21 +523,34 @@ export function evaluateCombat(attacker, defender, gameState) {
     return { shouldAttack, reason, attackerValue, defenderValue };
   }
 
-  // === STANDARD COMBAT RULES (non-transport, non-loaded-carrier) ===
-  if (defender.type === 'transport') { shouldAttack = true; reason = 'transport_high_value'; }
-  else if (defender.type === 'fighter' && attSpec.isLand) { shouldAttack = true; reason = 'tank_vs_fighter'; }
-  else if (defender.type === 'fighter' && attacker.type === 'destroyer') { shouldAttack = true; reason = 'destroyer_vs_fighter'; }
-  else if (attacker.type === 'submarine' && defSpec.isNaval && !defSpec.detectsSubs) { shouldAttack = true; reason = 'sub_stealth'; }
-  else if (attacker.type === 'destroyer' && defender.type === 'submarine') { shouldAttack = true; reason = 'destroyer_vs_sub'; }
-  else if (attacker.strength >= defender.strength * 1.5) { shouldAttack = true; reason = 'strength_advantage'; }
-  else if (defenderValue > attackerValue * 1.2) { shouldAttack = true; reason = 'economic_value'; }
-  else if ((attacker.type === 'battleship' || attacker.type === 'carrier') && defender.strength <= 4) { shouldAttack = true; reason = 'heavy_vs_light'; }
+  // === EXPECTED VALUE COMBAT ASSESSMENT ===
+  // Estimate win probability via a rounds-to-kill model:
+  //   effAttack  = expected damage dealt per round (dice × 0.5 hit chance × damage-per-hit)
+  //   effDefense = same for defender; 0 if defender cannot fight back (sub stealth)
+  //   winProb    = roundsToKillAttacker / (roundsToKillDef + roundsToKillAtt)
+  //              → approaches 1.0 when attacker kills much faster; 0.0 when it dies first
+  const effAttack  = attRolls * 0.5 * attSpec.damagePerHit;
+  const effDefense = defCanFightBack ? defRolls * 0.5 * defSpec.defenseDamagePerHit : 0;
+  const roundsToKillDef = defender.strength / effAttack;
+  const roundsToKillAtt = effDefense > 0 ? attacker.strength / effDefense : Infinity;
+  const winProb = roundsToKillAtt === Infinity ? 1.0
+                : roundsToKillAtt / (roundsToKillDef + roundsToKillAtt);
 
+  const netEV = winProb * defenderValue - (1 - winProb) * attackerValue;
+
+  // Accept a small negative EV to account for strategic value (threat removal, area control)
+  // that the pure economic model doesn't capture.
+  const baseThreshold = -attackerValue * 0.15;
+  shouldAttack = netEV > baseThreshold;
+  reason = `ev(${netEV.toFixed(1)},win${(winProb * 100).toFixed(0)}%)`;
+
+  // Near a friendly repair city: tolerate a worse trade (unit can heal if it survives)
   const nearFriendlyCity = Object.values(gameState.cities).some(c =>
     c.owner === 'ai' && manhattanDistance(attacker.x, attacker.y, c.x, c.y) <= 3
   );
-  if (nearFriendlyCity && !shouldAttack && attacker.strength >= defender.strength) {
-    shouldAttack = true; reason = 'near_repair';
+  if (nearFriendlyCity && netEV > -attackerValue * 0.35) {
+    shouldAttack = true;
+    reason = `ev_near_repair(${netEV.toFixed(1)})`;
   }
 
   return { shouldAttack, reason, attackerValue, defenderValue };

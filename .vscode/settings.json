@@ -1,0 +1,8 @@
+{
+  "workbench.panel.defaultLocation": "right",
+  "workbench.sideBar.location": "left",
+  "workbench.activityBar.location": "default",
+  "editor.minimap.enabled": false,
+  "workbench.statusBar.visible": true,
+  "window.title": "Strategic Conquest"
+}

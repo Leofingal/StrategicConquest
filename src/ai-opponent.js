@@ -30,7 +30,7 @@ import {
 } from './ai-helpers.js';
 import { planProduction } from './ai-city-manager.js';
 import { assignExplorationMissions, updateIslandKnowledge } from './ai-exploration-manager.js';
-import { assignTacticalMissions, detectThreats } from './ai-tactical-manager.js';
+import { assignTacticalMissions, detectThreats, getNavalDangerZone } from './ai-tactical-manager.js';
 
 // Re-export config for external consumers
 export { PHASE, AI_CONFIG };
@@ -368,7 +368,10 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
       }
 
       if (decision.action === 'move_toward') {
-        const moveTarget = getMoveToward(unit, decision.target, s);
+        // Transports avoid known enemy naval positions — compute danger zone tiles once
+        // per move decision and pass as tile cost hints to the pathfinder.
+        const avoidTiles = UNIT_SPECS[unit.type]?.carriesTanks ? getNavalDangerZone(s, k) : null;
+        const moveTarget = getMoveToward(unit, decision.target, s, avoidTiles);
         if (moveTarget) {
           s = executeMove(s, unitIdx, moveTarget, unit, turnLog, observationState);
         } else {
@@ -551,6 +554,30 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
         // Priority 3: No water to explore - wait
         return { action: 'wait', reason: 'transport_loaded_no_destination' };
       }
+    }
+  }
+
+  // ===== TRANSPORT: EVADE NEARBY NAVAL THREATS =====
+  // If a transport finds itself within close range of an enemy combat ship, abort the
+  // current mission and retreat toward the nearest friendly city. The avoidTiles routing
+  // in getMoveToward handles proactive rerouting; this handles reactive evasion when
+  // already inside the danger zone.
+  if (spec.carriesTanks) {
+    const nearbyThreats = threats.playerNavalCombat.filter(t =>
+      manhattanDistance(unit.x, unit.y, t.x, t.y) <= 3
+    );
+    if (nearbyThreats.length > 0) {
+      const safeTarget = aiCities.reduce((best, c) => {
+        const d = manhattanDistance(unit.x, unit.y, c.x, c.y);
+        return (!best || d < best.d) ? { x: c.x, y: c.y, d } : best;
+      }, null);
+      if (safeTarget) {
+        log(`[TRANSPORT] #${unit.id} at (${unit.x},${unit.y}) evading ${nearbyThreats.length} threat(s), retreating to city at (${safeTarget.x},${safeTarget.y})`);
+        return { action: 'move_toward', target: safeTarget, reason: 'transport_evade_threat' };
+      }
+      // No friendly city to flee to — hold position rather than sailing deeper into danger
+      log(`[TRANSPORT] #${unit.id} cornered by threats, holding position`);
+      return { action: 'wait', reason: 'transport_cornered_by_threat' };
     }
   }
 

@@ -411,7 +411,7 @@ export function getBombardTargets(unit, gameState, fog, FOG_VISIBLE_VALUE = 2) {
  * Find path from start to end using A* pathfinding
  * Returns: Array<{x, y}> or null if no path exists
  */
-export function findPath(startX, startY, endX, endY, unit, gameState, maxDistance = 1000) {
+export function findPath(startX, startY, endX, endY, unit, gameState, maxDistance = 1000, tileCostFn = null) {
   const spec = UNIT_SPECS[unit.type];
   const { map, width: W, height: H } = gameState;
   
@@ -463,7 +463,7 @@ export function findPath(startX, startY, endX, endY, unit, gameState, maxDistanc
       open.push({
         x: nx,
         y: ny,
-        g: cur.g + 1,
+        g: cur.g + (tileCostFn ? tileCostFn(nx, ny) : 1),
         h: Math.abs(endX - nx) + Math.abs(endY - ny),
         path: [...cur.path, { x: nx, y: ny }]
       });

@@ -1127,13 +1127,7 @@ export function CityListDialog({ cities, units, onClose, onSelectCity }) {
  * BUG #1 FIX: Now captures Enter key to confirm patrol
  * BUG #2 FIX: Now shows total patrol route distance
  */
-export function PatrolConfirmDialog({ waypoints, onConfirm, onCancel }) {
-  // Calculate total distance
-  let totalDist = 0;
-  for (let i = 0; i < waypoints.length; i++) {
-    const next = waypoints[(i + 1) % waypoints.length];
-    totalDist += Math.abs(waypoints[i].x - next.x) + Math.abs(waypoints[i].y - next.y);
-  }
+export function PatrolConfirmDialog({ waypoints, segmentDistances, onConfirm, onCancel }) {
   
   // BUG #1 FIX: Handle keyboard events - Enter confirms, Escape cancels
   const handleKeyDown = (e) => {
@@ -1163,31 +1157,49 @@ export function PatrolConfirmDialog({ waypoints, onConfirm, onCancel }) {
       tabIndex={-1}
       ref={(el) => el?.focus()}
     >
-      <div style={{ 
-        backgroundColor: COLORS.panel, 
-        border: `2px solid ${COLORS.patrolLine}`, 
-        width: 300, 
-        boxShadow: '0 4px 20px rgba(0,0,0,0.5)' 
+      <div style={{
+        backgroundColor: COLORS.panel,
+        border: `2px solid ${COLORS.patrolLine}`,
+        width: 380,
+        boxShadow: '0 4px 20px rgba(0,0,0,0.5)'
       }}>
-        <div style={{ 
-          backgroundColor: COLORS.patrolLine, 
-          padding: '8px 12px', 
-          fontSize: 12, 
-          fontWeight: 600, 
-          letterSpacing: 1, 
-          textTransform: 'uppercase', 
-          color: '#fff' 
+        <div style={{
+          backgroundColor: COLORS.patrolLine,
+          padding: '8px 12px',
+          fontSize: 12,
+          fontWeight: 600,
+          letterSpacing: 1,
+          textTransform: 'uppercase',
+          color: '#fff'
         }}>
           Confirm Patrol
         </div>
-        <div style={{ padding: 16, textAlign: 'center' }}>
-          <p style={{ fontSize: 12, marginBottom: 8 }}>
-            Set patrol with {waypoints.length} waypoints?
-          </p>
-          <p style={{ fontSize: 11, color: COLORS.textMuted }}>
-            Total route distance: {totalDist} tiles
-          </p>
-          <p style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 8 }}>
+        <div style={{ padding: 16 }}>
+          {segmentDistances && (
+            <div style={{ fontSize: 11, marginBottom: 10 }}>
+              {segmentDistances.segs.map((d, i) => (
+                <div key={i} style={{ display: 'flex', justifyContent: 'space-between', color: COLORS.text, marginBottom: 3 }}>
+                  <span>WP{i} ({waypoints[i].x},{waypoints[i].y}) → WP{i+1} ({waypoints[i+1].x},{waypoints[i+1].y})</span>
+                  <span style={{ marginLeft: 12, whiteSpace: 'nowrap' }}>{d} tiles</span>
+                </div>
+              ))}
+              <div style={{ display: 'flex', justifyContent: 'space-between', color: COLORS.textMuted, marginBottom: 3 }}>
+                <span>Return WP{segmentDistances.segs.length} → WP0</span>
+                <span style={{ marginLeft: 12 }}>{segmentDistances.returnDist} tiles</span>
+              </div>
+              <div style={{ borderTop: `1px solid ${COLORS.border}`, marginTop: 6, paddingTop: 6 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', color: COLORS.textMuted, fontSize: 10, marginBottom: 2 }}>
+                  <span>Subtotal (excl. return)</span>
+                  <span>{segmentDistances.subtotal} tiles</span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 600, fontSize: 12 }}>
+                  <span>Total (incl. return)</span>
+                  <span>{segmentDistances.total} tiles</span>
+                </div>
+              </div>
+            </div>
+          )}
+          <p style={{ fontSize: 10, color: COLORS.textMuted, marginTop: 4, textAlign: 'center' }}>
             Unit will patrol continuously until given new orders
           </p>
         </div>
