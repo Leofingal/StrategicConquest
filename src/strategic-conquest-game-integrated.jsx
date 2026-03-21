@@ -16,7 +16,7 @@ import { createGameState, setUnitGoTo, setUnitPatrol, setUnitStatus, unloadUnit,
 import { executeAITurn, createAIKnowledge, createAIKnowledgeFromState, recordPlayerObservations } from './ai-opponent.js';
 import { generateMap, MAP_SIZES, TERRAIN_TYPES, DIFFICULTY_LEVELS } from './map-generator.js';
 import { Tile, UnitSprite, MiniMap, TurnInfo, UnitInfoPanel, CommandMenu, GotoLineOverlay, PatrolOverlay } from './ui-components.jsx';
-import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, getSavedGames } from './dialog-components.jsx';
+import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, HelpDialog, getSavedGames } from './dialog-components.jsx';
 
 // ============================================================================
 // LEADERBOARD
@@ -164,6 +164,7 @@ function resolveBombardment(attacker, defender) {
 function MenuScreen({ onStart, onLoadGame }) {
   const [mapSize, setMapSize] = useState('small'), [terrain, setTerrain] = useState('normal'), [difficulty, setDifficulty] = useState(5);
   const [showLoadDialog, setShowLoadDialog] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const scores = getTopScores(mapSize, difficulty);
   const hasSaves = getSavedGames().some(s => s !== null);
   const selectStyle = { width: '100%', padding: '8px', backgroundColor: COLORS.panelLight, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: '12px' };
@@ -201,8 +202,12 @@ function MenuScreen({ onStart, onLoadGame }) {
           LOAD GAME
         </button>
         {scores.length > 0 && <div style={{ marginTop: '16px', fontSize: '10px', color: COLORS.textMuted }}><div style={{ marginBottom: '4px' }}>Best scores ({mapSize}, difficulty {difficulty}):</div>{scores.map((s, i) => <div key={i}>{i + 1}. {s.turns} turns ({s.date})</div>)}</div>}
+        <div style={{ marginTop: '12px', textAlign: 'right' }}>
+          <button onClick={() => setShowHelp(true)} title="Starting Conditions Help" style={{ background: 'none', border: `1px solid ${COLORS.textMuted}`, color: COLORS.textMuted, fontSize: '11px', cursor: 'pointer', borderRadius: '50%', width: 22, height: 22, display: 'inline-flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold' }}>?</button>
+        </div>
       </div>
       {showLoadDialog && <LoadGameDialog onLoad={handleLoad} onClose={() => setShowLoadDialog(false)} />}
+      {showHelp && <HelpDialog title="Starting Conditions Guide" guide="starting" onClose={() => setShowHelp(false)} />}
     </div>
   );
 }
@@ -486,7 +491,27 @@ export default function StrategicConquestGame() {
       
       return updated;
     });
-    
+
+    // If a carrier just moved, refuel any friendly aircraft already at the destination
+    if (spec.carriesAir) {
+      const aircraftAtDest = newUnits.filter(u =>
+        u.x === targetX &&
+        u.y === targetY &&
+        u.owner === unit.owner &&
+        u.id !== unitId &&
+        !u.aboardId &&
+        UNIT_SPECS[u.type].isAir
+      );
+      for (const aircraft of aircraftAtDest) {
+        const aIdx = newUnits.findIndex(u => u.id === aircraft.id);
+        if (aIdx !== -1) {
+          const aSpec = UNIT_SPECS[aircraft.type];
+          newUnits[aIdx] = { ...newUnits[aIdx], fuel: aSpec.fuel };
+          console.log(`[CARRIER][AUTO] Aircraft ${aircraft.id} refueled by carrier arriving at (${targetX},${targetY})`);
+        }
+      }
+    }
+
     // Check if unit ran out of fuel (crashes)
     const movedUnit = newUnits.find(u => u.id === unitId);
     if (spec.fuel && movedUnit.fuel <= 0) {
@@ -506,7 +531,7 @@ export default function StrategicConquestGame() {
       if (!isOnFriendlyCity && !movedUnit.aboardId && !carrierAtCrashLoc) {
         // Crash!
         console.log(`[AUTO-MOVE] Unit ${unitId} crashed - out of fuel`);
-        const survivingUnits = newUnits.filter(u => u.id !== unitId);
+        const survivingUnits = newUnits.filter(u => u.id !== unitId && u.aboardId !== unitId);
         return {
           newState: { ...state, units: survivingUnits },
           stopped: true,
@@ -905,7 +930,7 @@ export default function StrategicConquestGame() {
           }
           
           if (unit.strength <= 0) { 
-            newUnits = newUnits.filter(u => u.id !== unit.id);
+            newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
             unitDestroyed = true; // BUG #10 FIX
             setMessage('Your unit was destroyed!'); 
             return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
@@ -950,8 +975,9 @@ export default function StrategicConquestGame() {
             const result = resolveCombat(unit, defender, newUnits); 
             unit.strength = result.attRem;
             
-            if (result.defDead) { 
-              newUnits = newUnits.filter(u => u.id !== defender.id); 
+            if (result.defDead) {
+              // Remove defender and any cargo it was carrying
+              newUnits = newUnits.filter(u => u.id !== defender.id && u.aboardId !== defender.id);
               setMessage(`Enemy ${UNIT_SPECS[defender.type].name} destroyed!`); 
               
               const remainingEnemies = newUnits.filter(u => 
@@ -989,10 +1015,10 @@ export default function StrategicConquestGame() {
               }
             }
             
-            if (unit.strength <= 0) { 
-              newUnits = newUnits.filter(u => u.id !== unit.id);
+            if (unit.strength <= 0) {
+              newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
               unitDestroyed = true; // BUG #10 FIX
-              setMessage('Your unit was destroyed!'); 
+              setMessage('Your unit was destroyed!');
               return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
             }
           }
@@ -1046,10 +1072,28 @@ export default function StrategicConquestGame() {
                 console.log(`[CARRIER][BUG11] Fighter ${fighter.id} moved with carrier to (${move.x},${move.y})`);
               }
             }
+
+            // Refuel friendly aircraft already sitting at the carrier's destination
+            const aircraftAtDest = newUnits.filter(u =>
+              u.x === move.x &&
+              u.y === move.y &&
+              u.owner === unit.owner &&
+              u.id !== unit.id &&
+              !u.aboardId &&
+              UNIT_SPECS[u.type].isAir
+            );
+            for (const aircraft of aircraftAtDest) {
+              const aIdx = newUnits.findIndex(u => u.id === aircraft.id);
+              if (aIdx !== -1) {
+                const aSpec = UNIT_SPECS[aircraft.type];
+                newUnits[aIdx] = { ...newUnits[aIdx], fuel: aSpec.fuel };
+                console.log(`[CARRIER] Aircraft ${aircraft.id} refueled by carrier arriving at (${move.x},${move.y})`);
+              }
+            }
           }
-          
-          unit.x = move.x; 
-          unit.y = move.y; 
+
+          unit.x = move.x;
+          unit.y = move.y;
           if (!move.isAttack) {
             unit.movesLeft--;
           }
@@ -1089,7 +1133,7 @@ export default function StrategicConquestGame() {
               }
             }
             if (unit.fuel <= 0 && !isOnFriendlyCity && !unit.aboardId && !carrierAtLocation) { 
-              newUnits = newUnits.filter(u => u.id !== unit.id);
+              newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
               unitDestroyed = true;
               setMessage(`${spec.name} crashed!`); 
               return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
@@ -1702,9 +1746,24 @@ export default function StrategicConquestGame() {
               />
             );
           }))}
-          {gameState.units.filter(u => !u.aboardId && u.x >= viewportX && u.x < viewportX + VIEWPORT_TILES_X && u.y >= viewportY && u.y < viewportY + VIEWPORT_TILES_Y && (u.owner === 'player' || fog[u.y]?.[u.x] === FOG_VISIBLE)).sort((a, b) => (a.id === gameState.activeUnitId ? 1 : 0) - (b.id === gameState.activeUnitId ? 1 : 0)).map(u => (
-            <div key={u.id} style={{ position: 'absolute', left: (u.x - viewportX) * TILE_WIDTH, top: (u.y - viewportY) * TILE_HEIGHT, pointerEvents: 'none' }}><UnitSprite unit={u} isActive={u.id === gameState.activeUnitId} blink={blink} cargoCount={getCargoCount(u.id, gameState.units)} /></div>
-          ))}
+          {(() => {
+            const visibleUnits = gameState.units
+              .filter(u => !u.aboardId && u.x >= viewportX && u.x < viewportX + VIEWPORT_TILES_X && u.y >= viewportY && u.y < viewportY + VIEWPORT_TILES_Y && (u.owner === 'player' || fog[u.y]?.[u.x] === FOG_VISIBLE))
+              .sort((a, b) => (a.id === gameState.activeUnitId ? 1 : 0) - (b.id === gameState.activeUnitId ? 1 : 0));
+            // Per-tile stack counts and top unit (last in sorted order wins visually)
+            const tileStack = {};
+            const tileTop = {};
+            for (const u of visibleUnits) {
+              const k = `${u.x},${u.y}`;
+              tileStack[k] = (tileStack[k] || 0) + 1;
+              tileTop[k] = u.id;
+            }
+            return visibleUnits.map(u => (
+              <div key={u.id} style={{ position: 'absolute', left: (u.x - viewportX) * TILE_WIDTH, top: (u.y - viewportY) * TILE_HEIGHT, pointerEvents: 'none' }}>
+                <UnitSprite unit={u} isActive={u.id === gameState.activeUnitId} blink={blink} cargoCount={getCargoCount(u.id, gameState.units)} stackCount={tileTop[`${u.x},${u.y}`] === u.id ? tileStack[`${u.x},${u.y}`] : 0} />
+              </div>
+            ));
+          })()}
           {(gotoMode || dragging) && previewTarget && activeUnit && gotoPreview && <GotoLineOverlay sx={getUnitLocation(activeUnit, gameState.units).x} sy={getUnitLocation(activeUnit, gameState.units).y} ex={previewTarget.x} ey={previewTarget.y} vx={viewportX} vy={viewportY} dist={gotoPreview.dist} turns={gotoPreview.turns} />}
           {patrolMode && patrolWaypoints.length > 0 && <PatrolOverlay waypoints={patrolWaypoints} vx={viewportX} vy={viewportY} />}
           {/* BUG #2 FIX: Render observation trails from AI turn */}

@@ -1,7 +1,7 @@
 # Module Integration Guide
 
 ## Purpose
-Detailed guide for integrating all modules into the main game orchestrator. Shows data flow, event handling, and coordination between independent modules.
+Guide to how modules connect in the main game orchestrator (`strategic-conquest-game-integrated.jsx`). Covers data flow, event handling, and coordination between modules.
 
 ---
 
@@ -9,786 +9,310 @@ Detailed guide for integrating all modules into the main game orchestrator. Show
 
 ```
 User Input (keyboard/mouse)
-         ↓
-   Game Orchestrator (strategic-conquest-game.jsx)
-         ↓
-   ┌─────┴─────┐
-   ↓           ↓
-Game State   UI State
-   ↓           ↓
-   ├→ Movement Engine → Valid Moves
-   ├→ Combat Engine → Battle Results  
-   ├→ Fog of War → Visibility
-   ├→ AI Opponent → AI Actions
-   └→ Production → New Units
-         ↓
+         |
+   Game Orchestrator (strategic-conquest-game-integrated.jsx)
+         |
+   +---------+----------+
+   |                    |
+Game State          UI State
+   |
+   +-> Movement Engine  -> Valid Moves, Pathfinding, Bombard Targets
+   +-> Combat (inline)  -> Battle Results
+   +-> Fog of War       -> Visibility
+   +-> AI Opponent      -> AI Actions (on end turn)
+   +-> game-state.js    -> Production, Status changes, Turn transitions
+         |
    Updated State
-         ↓
+         |
    UI Components (render)
 ```
 
 ---
 
-## Main Game Structure
-
-### State Management
+## State Management in Main Component
 
 ```javascript
-function StrategicConquestGame() {
-  // Core game state
-  const [gameState, setGameState] = useState(null);
-  const [phase, setPhase] = useState(PHASE_MENU);
-  
-  // Viewport
-  const [viewportX, setViewportX] = useState(0);
-  const [viewportY, setViewportY] = useState(0);
-  
-  // Fog of war (player perspective)
-  const [exploredTiles, setExploredTiles] = useState(() => new Set());
-  const [turnVisibility, setTurnVisibility] = useState(() => new Set());
-  
-  // AI knowledge (separate fog)
-  const [aiExplored, setAiExplored] = useState(() => new Set());
-  const [aiKnowledge, setAiKnowledge] = useState(() => createAIKnowledge());
-  
-  // UI state
-  const [message, setMessage] = useState('');
-  const [showCityDialog, setShowCityDialog] = useState(null);
-  const [gotoMode, setGotoMode] = useState(false);
-  const [patrolMode, setPatrolMode] = useState(false);
-  
-  // ... rest of component
-}
+// Core game state
+const [gameState, setGameState] = useState(null);
+const [phase, setPhase] = useState(PHASE_MENU);
+
+// Viewport
+const [viewportX, setViewportX] = useState(0);
+const [viewportY, setViewportY] = useState(0);
+
+// Fog of war (player perspective)
+const [exploredTiles, setExploredTiles] = useState(() => new Set());
+const [turnVisibility, setTurnVisibility] = useState(() => new Set());
+
+// AI knowledge
+const [aiKnowledge, setAiKnowledge] = useState(() => createAIKnowledge());
+
+// Mode state
+const [gotoMode, setGotoMode] = useState(false);
+const [patrolMode, setPatrolMode] = useState(false);
+const [bombardMode, setBombardMode] = useState(false);
+
+// Auto-movement (GoTo/Patrol execution)
+const [autoMovingUnitId, setAutoMovingUnitId] = useState(null);
+const [autoMoveQueue, setAutoMoveQueue] = useState([]);
 ```
 
 ---
 
 ## Integration Point 1: Game Initialization
 
-### Menu → New Game
-
 ```javascript
 import { generateMap } from './map-generator.js';
 import { createGameState } from './game-state.js';
+import { createAIKnowledge } from './ai-opponent.js';
 
 const handleStartGame = (mapSize, terrain, difficulty) => {
-  // 1. Generate map
   const mapData = generateMap(mapSize, terrain, difficulty);
-  
-  // 2. Create game state
-  const state = createGameState(mapData, mapSize, terrain, difficulty);
-  
-  // 3. Initialize fog
+  const newState = createGameState(mapData, mapSize, terrain, difficulty);
+
+  // Initialize AI knowledge with AI's starting city position
+  const aiCity = Object.values(newState.cities).find(c => c.owner === 'ai');
+  setAiKnowledge(createAIKnowledge(aiCity?.x, aiCity?.y));
+
+  setGameState(newState);
+  setPhase(PHASE_PLAYING);
   setExploredTiles(new Set());
   setTurnVisibility(new Set());
-  setAiExplored(new Set());
-  
-  // 4. Initialize AI knowledge
-  const aiVis = calculateVisibility(state, 'ai');
-  setAiKnowledge(createAIKnowledge(aiVis));
-  
-  // 5. Center viewport on player starting city
-  const playerCity = Object.values(state.cities).find(c => c.owner === 'player');
-  if (playerCity) {
-    setViewportX(Math.max(0, playerCity.x - VIEWPORT_TILES_X / 2));
-    setViewportY(Math.max(0, playerCity.y - VIEWPORT_TILES_Y / 2));
-  }
-  
-  // 6. Start game
-  setGameState(state);
-  setPhase(PHASE_PLAYING);
-  setMessage('Turn 1: Explore and conquer!');
 };
 ```
 
 ---
 
-## Integration Point 2: Player Movement
+## Integration Point 2: Fog of War
 
-### User Input → Movement Execution
-
-```javascript
-import { getValidMoves } from './movement-engine.js';
-import { moveUnit } from './game-state.js';
-
-// Calculate valid moves (computed every render for active unit)
-const validMoves = useMemo(() => {
-  if (!activeUnit || activeUnit.movesLeft <= 0) return [];
-  return getValidMoves(activeUnit, gameState);
-}, [activeUnit, gameState]);
-
-// Handle keyboard movement
-const handleMove = (dx, dy) => {
-  if (!activeUnit) return;
-  
-  // Get unit's current location (might be aboard carrier)
-  const pos = getUnitLocation(activeUnit, gameState);
-  const targetX = pos.x + dx;
-  const targetY = pos.y + dy;
-  
-  // Check if this move is valid
-  const move = validMoves.find(m => m.x === targetX && m.y === targetY);
-  if (!move) {
-    setMessage('Invalid move.');
-    return;
-  }
-  
-  // Execute move (handles combat, boarding, etc.)
-  const result = moveUnit(gameState, activeUnit.id, dx, dy);
-  
-  if (result.success) {
-    setGameState(result.state);
-    setMessage(result.message);
-    
-    // If unit destroyed, advance to next
-    if (result.unitDestroyed) {
-      const nextId = findNextUnit(result.state);
-      setGameState(prev => ({ ...prev, activeUnitId: nextId }));
-    }
-  } else {
-    setMessage(result.message);
-  }
-};
-
-// Keyboard handler
-useEffect(() => {
-  const handleKeyDown = (e) => {
-    const dir = DIRECTIONS[e.key]; // numpad keys
-    if (dir) {
-      e.preventDefault();
-      handleMove(dir.dx, dir.dy);
-    }
-  };
-  
-  window.addEventListener('keydown', handleKeyDown);
-  return () => window.removeEventListener('keydown', handleKeyDown);
-}, [handleMove]);
-```
-
----
-
-## Integration Point 3: Combat Resolution
-
-### Movement with Attack → Combat Engine
+Fog is computed via `useMemo` each render:
 
 ```javascript
-import { simulateCombat, resolveCityAttack } from './combat-engine.js';
+import { calculateVisibility, buildFogArray, updateExploredTiles } from './fog-of-war.js';
 
-// This happens inside game-state.js moveUnit() function
-function executeMove(unit, targetX, targetY, move, gameState) {
-  if (move.isAttack && move.isCity) {
-    // Attacking city
-    const result = resolveCityAttack(unit, gameState);
-    
-    if (result.cityDestroyed) {
-      // Capture city
-      const cityKey = `${targetX},${targetY}`;
-      const newCities = { ...gameState.cities };
-      newCities[cityKey] = {
-        ...newCities[cityKey],
-        owner: unit.owner,
-        producing: 'tank',
-        progress: {}
-      };
-      
-      // Update map tile
-      const newMap = gameState.map.map(row => [...row]);
-      newMap[targetY][targetX] = unit.owner === 'player' ? PLAYER_CITY : AI_CITY;
-      
-      // Move unit to city
-      const newUnits = gameState.units.map(u => 
-        u.id === unit.id 
-          ? { ...u, x: targetX, y: targetY, strength: result.attackerRemainingStrength, movesLeft: 0, status: STATUS_USED }
-          : u
-      );
-      
-      return {
-        state: { ...gameState, map: newMap, cities: newCities, units: newUnits },
-        message: 'City captured!',
-        showCityDialog: true
-      };
-    } else {
-      // Attack failed
-      const newUnits = gameState.units.map(u =>
-        u.id === unit.id
-          ? { ...u, strength: result.attackerRemainingStrength, movesLeft: Math.max(0, u.movesLeft - 1) }
-          : u
-      );
-      
-      return {
-        state: { ...gameState, units: newUnits },
-        message: `Attack failed. Unit: ${result.attackerRemainingStrength}/${UNIT_SPECS[unit.type].strength}`
-      };
-    }
-  }
-  
-  if (move.isAttack && !move.isCity) {
-    // Attacking unit
-    const enemyIdx = gameState.units.findIndex(u => 
-      u.x === targetX && u.y === targetY && u.owner !== unit.owner
-    );
-    const enemy = gameState.units[enemyIdx];
-    
-    const result = simulateCombat(unit, enemy, gameState);
-    
-    let newUnits = [...gameState.units];
-    
-    // Update attacker
-    const attackerIdx = newUnits.findIndex(u => u.id === unit.id);
-    newUnits[attackerIdx] = {
-      ...newUnits[attackerIdx],
-      strength: result.attackerRemainingStrength,
-      movesLeft: Math.max(0, newUnits[attackerIdx].movesLeft - 1)
-    };
-    
-    if (result.defenderSurvived) {
-      // Update defender
-      newUnits[enemyIdx] = {
-        ...newUnits[enemyIdx],
-        strength: result.defenderRemainingStrength
-      };
-    } else {
-      // Remove defender
-      newUnits = newUnits.filter(u => u.id !== enemy.id);
-      
-      // Attacker moves into square if survived
-      if (result.attackerSurvived) {
-        const attackerIdx = newUnits.findIndex(u => u.id === unit.id);
-        newUnits[attackerIdx] = {
-          ...newUnits[attackerIdx],
-          x: targetX,
-          y: targetY
-        };
-      }
-    }
-    
-    // Remove attacker if destroyed
-    if (!result.attackerSurvived) {
-      newUnits = newUnits.filter(u => u.id !== unit.id);
-    }
-    
-    return {
-      state: { ...gameState, units: newUnits },
-      message: `Combat: Dealt ${result.damageToDefender}, took ${result.damageToAttacker}`,
-      unitDestroyed: !result.attackerSurvived
-    };
-  }
-  
-  // Normal movement (no combat)
-  // ... handle boarding, fuel, etc.
-}
-```
-
----
-
-## Integration Point 4: Fog of War
-
-### Every Turn → Update Visibility
-
-```javascript
-import { calculateVisibility, buildFogArray } from './fog-of-war.js';
-
-// Calculate current visibility (memoized)
-const currentVisibility = useMemo(() => 
+const currentVisibility = useMemo(() =>
   gameState ? calculateVisibility(gameState, 'player') : new Set(),
   [gameState]
 );
 
-// Build fog array for rendering
-const fog = useMemo(() => 
-  gameState 
-    ? buildFogArray(gameState.width, gameState.height, exploredTiles, currentVisibility, turnVisibility)
-    : [],
+const fog = useMemo(() =>
+  gameState ? buildFogArray(gameState.width, gameState.height, exploredTiles, currentVisibility, turnVisibility) : [],
   [gameState, exploredTiles, currentVisibility, turnVisibility]
 );
 
-// Update turn visibility as units move
+// Merge current visibility into explored tiles on every render
 useEffect(() => {
-  if (!gameState) return;
-  
-  // Add currently visible tiles to turn visibility
-  setTurnVisibility(prev => {
-    const newSet = new Set(prev);
-    currentVisibility.forEach(tile => newSet.add(tile));
-    return newSet;
-  });
+  if (gameState) setExploredTiles(prev => updateExploredTiles(prev, currentVisibility));
 }, [currentVisibility, gameState]);
-
-// On end turn, merge into explored tiles
-const handleEndTurn = () => {
-  // Merge turn visibility into permanent explored
-  setExploredTiles(prev => {
-    const newSet = new Set(prev);
-    turnVisibility.forEach(tile => newSet.add(tile));
-    currentVisibility.forEach(tile => newSet.add(tile));
-    return newSet;
-  });
-  
-  // Clear turn visibility
-  setTurnVisibility(new Set());
-  
-  // ... rest of end turn logic
-};
 ```
 
 ---
 
-## Integration Point 5: AI Turn
-
-### Player End Turn → AI Execution → Player Turn
+## Integration Point 3: Valid Moves and Bombard Targets
 
 ```javascript
-import { executeAITurn } from './ai-opponent.js';
-import { endPlayerTurn } from './game-state.js';
+import { getValidMoves, getBombardTargets } from './movement-engine.js';
 
-const handleEndTurn = () => {
-  // 1. Merge fog of war
-  setExploredTiles(prev => {
-    const newSet = new Set(prev);
-    turnVisibility.forEach(tile => newSet.add(tile));
-    currentVisibility.forEach(tile => newSet.add(tile));
-    return newSet;
-  });
-  setTurnVisibility(new Set());
-  
-  // 2. Process player end-of-turn (reset moves, production, healing)
-  let newState = endPlayerTurn(gameState);
-  
-  // 3. Execute AI turn
-  const aiResult = executeAITurn(newState, aiKnowledge, AI_CONFIG);
-  
-  // 4. Update AI knowledge
-  setAiKnowledge(aiResult.knowledge);
-  
-  // 5. Check victory conditions
-  const victory = checkVictoryCondition(aiResult.state);
-  if (victory.status !== 'playing') {
-    setPhase(victory.status === 'victory' ? PHASE_VICTORY : PHASE_DEFEAT);
-    setGameState(aiResult.state);
-    return;
-  }
-  
-  // 6. Find first available player unit
-  const firstUnitId = findNextUnit(aiResult.state);
-  
-  // 7. Update state
-  setGameState({
-    ...aiResult.state,
-    activeUnitId: firstUnitId,
-    turn: aiResult.state.turn + 1
-  });
-  
-  setMessage(`Turn ${aiResult.state.turn + 1}: Your move.`);
-};
-```
-
----
-
-## Integration Point 6: GoTo Pathfinding
-
-### User Sets Destination → Pathfinding → Auto-execution
-
-```javascript
-import { findPath } from './movement-engine.js';
-
-// Set GoTo destination
-const handleSetGoto = (destX, destY) => {
-  if (!activeUnit) return;
-  
-  const pos = getUnitLocation(activeUnit, gameState);
-  const path = findPath(pos.x, pos.y, destX, destY, activeUnit, gameState);
-  
-  if (!path || path.length === 0) {
-    setMessage('No path found!');
-    return;
-  }
-  
-  setGameState(prev => {
-    const newUnits = prev.units.map(u =>
-      u.id === activeUnit.id
-        ? { ...u, gotoPath: path, status: STATUS_GOTO }
-        : u
-    );
-    return { ...prev, units: newUnits };
-  });
-  
-  setMessage(`GoTo set: ${path.length} steps.`);
-};
-
-// Auto-execute GoTo (runs on timer)
-const executeGotoStep = useCallback(() => {
-  if (!activeUnit?.gotoPath || activeUnit.gotoPath.length === 0 || activeUnit.movesLeft <= 0) {
-    return false;
-  }
-  
-  const nextTile = activeUnit.gotoPath[0];
-  const moves = getValidMoves(activeUnit, gameState);
-  const move = moves.find(m => m.x === nextTile.x && m.y === nextTile.y);
-  
-  if (!move) {
-    // Path blocked - cancel GoTo
-    setGameState(prev => {
-      const newUnits = prev.units.map(u =>
-        u.id === activeUnit.id
-          ? { ...u, gotoPath: null, status: STATUS_READY }
-          : u
-      );
-      return { ...prev, units: newUnits };
-    });
-    setMessage('Path blocked!');
-    return false;
-  }
-  
-  // Execute move
-  const result = moveUnit(gameState, activeUnit.id, nextTile.x - activeUnit.x, nextTile.y - activeUnit.y);
-  
-  if (result.success) {
-    // Update path
-    setGameState(prev => {
-      const unit = prev.units.find(u => u.id === activeUnit.id);
-      const remaining = unit.gotoPath.slice(1);
-      
-      const newUnits = prev.units.map(u =>
-        u.id === activeUnit.id
-          ? { 
-              ...u, 
-              gotoPath: remaining.length > 0 ? remaining : null,
-              status: remaining.length === 0 ? STATUS_READY : STATUS_GOTO
-            }
-          : u
-      );
-      
-      return { ...result.state, units: newUnits };
-    });
-    
-    return true;
-  }
-  
-  return false;
-}, [activeUnit, gameState]);
-
-// Timer for auto-execution
-useEffect(() => {
-  if (phase !== PHASE_PLAYING || !activeUnit?.gotoPath) return;
-  
-  const timer = setTimeout(() => {
-    if (executeGotoStep()) {
-      // Continue executing
-    }
-  }, 150); // 150ms delay between moves
-  
-  return () => clearTimeout(timer);
-}, [phase, activeUnit, executeGotoStep]);
-```
-
----
-
-## Integration Point 7: City Production
-
-### Double-click City → Dialog → Set Production → Next Turn → Spawn Unit
-
-```javascript
-import { setCityProduction } from './game-state.js';
-
-// Open dialog
-const handleTileDoubleClick = (x, y) => {
-  const tile = gameState.map[y][x];
-  if (tile === PLAYER_CITY) {
-    const cityKey = `${x},${y}`;
-    if (gameState.cities[cityKey]) {
-      setShowCityDialog(cityKey);
-    }
-  }
-};
-
-// Set production
-const handleSetProduction = (cityKey, unitType) => {
-  const newState = setCityProduction(gameState, cityKey, unitType);
-  setGameState(newState);
-  setMessage(`Production set to ${UNIT_SPECS[unitType].name}.`);
-  setShowCityDialog(null);
-};
-
-// Production happens in endPlayerTurn()
-function endPlayerTurn(gameState) {
-  let newCities = { ...gameState.cities };
-  let newUnits = [...gameState.units];
-  let nextId = gameState.nextUnitId;
-  
-  Object.entries(newCities).forEach(([key, city]) => {
-    if (city.owner !== 'player' || !city.producing) return;
-    
-    const spec = UNIT_SPECS[city.producing];
-    const progress = (city.progress[city.producing] || 0) + 1;
-    
-    if (progress >= spec.productionDays) {
-      // Spawn unit
-      newUnits.push({
-        id: nextId++,
-        type: city.producing,
-        owner: 'player',
-        x: city.x,
-        y: city.y,
-        strength: spec.strength,
-        movesLeft: spec.movement,
-        fuel: spec.fuel,
-        status: STATUS_READY,
-        aboardId: null,
-        gotoPath: null,
-        patrolPath: null,
-        patrolIdx: 0
-      });
-      
-      // Reset progress
-      newCities[key] = {
-        ...city,
-        progress: { ...city.progress, [city.producing]: 0 }
-      };
-    } else {
-      // Increment progress
-      newCities[key] = {
-        ...city,
-        progress: { ...city.progress, [city.producing]: progress }
-      };
-    }
-  });
-  
-  return {
-    ...gameState,
-    cities: newCities,
-    units: newUnits,
-    nextUnitId: nextId
-  };
-}
-```
-
----
-
-## Integration Point 8: Rendering
-
-### Game State → UI Components
-
-```javascript
-import { Tile, UnitSprite, MiniMap, TurnInfo, CommandMenu } from './ui-components.jsx';
-
-return (
-  <div>
-    {/* Map viewport */}
-    <div style={{ width: VIEWPORT_TILES_X * TILE_SIZE, height: VIEWPORT_TILES_Y * TILE_SIZE }}>
-      {Array.from({ length: VIEWPORT_TILES_Y }, (_, vy) => {
-        const y = viewportY + vy;
-        return Array.from({ length: VIEWPORT_TILES_X }, (_, vx) => {
-          const x = viewportX + vx;
-          if (x < 0 || x >= gameState.width || y < 0 || y >= gameState.height) return null;
-          
-          const move = validMoves.find(m => m.x === x && m.y === y);
-          
-          return (
-            <Tile
-              key={`${x}-${y}`}
-              type={gameState.map[y][x]}
-              fogState={fog[y]?.[x] ?? FOG_UNEXPLORED}
-              x={x}
-              y={y}
-              isValidMove={!!move && !gotoMode}
-              isAttack={move?.isAttack}
-              onClick={() => handleTileClick(x, y)}
-              onDoubleClick={() => handleTileDoubleClick(x, y)}
-            />
-          );
-        });
-      })}
-      
-      {/* Units */}
-      {gameState.units
-        .filter(u => !u.aboardId && u.x >= viewportX && u.x < viewportX + VIEWPORT_TILES_X &&
-                     u.y >= viewportY && u.y < viewportY + VIEWPORT_TILES_Y)
-        .filter(u => u.owner === 'player' || fog[u.y]?.[u.x] === FOG_VISIBLE)
-        .map(unit => (
-          <UnitSprite
-            key={unit.id}
-            unit={unit}
-            isActive={unit.id === gameState.activeUnitId}
-            blink={blink}
-            onClick={(e) => handleUnitClick(unit, e)}
-            cargoCount={gameState.units.filter(u => u.aboardId === unit.id).length}
-          />
-        ))}
-    </div>
-    
-    {/* UI Panels */}
-    <TurnInfo
-      turn={gameState.turn}
-      phase={phase}
-      unitsWaiting={unitsWaiting}
-      playerCities={cityCounts.player}
-      aiCities={cityCounts.ai}
-      neutralCities={cityCounts.neutral}
-      onEndTurn={handleEndTurn}
-      onShowCityList={() => setShowCityList(true)}
-    />
-    
-    <MiniMap
-      map={gameState.map}
-      fog={fog}
-      units={gameState.units}
-      width={gameState.width}
-      height={gameState.height}
-      viewportX={viewportX}
-      viewportY={viewportY}
-      onNavigate={handleNavigate}
-    />
-    
-    <CommandMenu
-      activeUnit={activeUnit}
-      onCommand={handleCommand}
-      disabled={!activeUnit || activeUnit.aboardId}
-      patrolMode={patrolMode}
-    />
-  </div>
-);
-```
-
----
-
-## Error Handling Strategy
-
-### Defensive Programming at Integration Points
-
-```javascript
-// Always validate state before operations
-const handleMove = (dx, dy) => {
-  if (!gameState) {
-    console.error('No game state');
-    return;
-  }
-  
-  if (!activeUnit) {
-    setMessage('No unit selected.');
-    return;
-  }
-  
-  if (activeUnit.movesLeft <= 0) {
-    setMessage('Unit has no moves left.');
-    return;
-  }
-  
-  // ... proceed with move
-};
-
-// Wrap external module calls in try-catch
-try {
-  const result = moveUnit(gameState, unitId, dx, dy);
-  setGameState(result.state);
-} catch (error) {
-  console.error('Move failed:', error);
-  setMessage('Error: Move failed. Please report this bug.');
-}
-
-// Validate AI results
-const aiResult = executeAITurn(gameState, aiKnowledge);
-if (!aiResult || !aiResult.state || !aiResult.knowledge) {
-  console.error('Invalid AI result:', aiResult);
-  setMessage('AI turn failed. Skipping.');
-  return;
-}
-```
-
----
-
-## Performance Considerations
-
-### Memoization & Optimization
-
-```javascript
-// Memoize expensive calculations
-const validMoves = useMemo(() => 
-  activeUnit ? getValidMoves(activeUnit, gameState) : [],
+const validMoves = useMemo(() =>
+  activeUnit && gameState ? getValidMoves(activeUnit, gameState) : [],
   [activeUnit, gameState]
 );
 
-const currentVisibility = useMemo(() => 
-  gameState ? calculateVisibility(gameState, 'player') : new Set(),
-  [gameState]
-);
+const bombardTargets = useMemo(() => {
+  if (!bombardMode || !activeUnit || !gameState) return [];
+  if (activeUnit.hasBombarded) return [];
+  return getBombardTargets(activeUnit, gameState, fog, FOG_VISIBLE);
+}, [bombardMode, activeUnit, gameState, fog]);
+```
 
-// Throttle AI execution
-const executeAIWithDelay = async (state) => {
-  // Add small delays between AI unit actions for visibility
-  for (const unit of aiUnits) {
-    await new Promise(resolve => setTimeout(resolve, 100));
-    // Process unit
+---
+
+## Integration Point 4: Combat Resolution (Inline Functions)
+
+Combat is resolved by inline functions in `strategic-conquest-game-integrated.jsx` (not in a separate module). These functions mirror the same dice-roll logic for all combat types.
+
+### Unit vs Unit
+
+```javascript
+function simulateCombatWithDefender(attacker, defender, allUnits = []) {
+  // Base rolls adjusted for current strength ratio
+  // Carrier bonus: +1 attack/defense die per 2 fighters aboard
+  // Submarine stealth: defender can't fight back (dRolls = 0) unless detectsSubs
+  // Naval vs land: 33% hit chance instead of 50%
+  // Returns: { dmgToDef, dmgToAtt, attRem, defRem }
+}
+
+const resolveCombat = (att, def, allUnits = []) => { ... };
+```
+
+### Unit vs City
+
+```javascript
+// City has 1 strength point (CITY_COMBAT from game-constants.js)
+const resolveCityAttack = (att) => { ... };
+```
+
+### Battleship Bombardment
+
+```javascript
+function resolveBombardment(attacker, defender) {
+  // ceil(strength * 0.5) rolls at BOMBARD_HIT_CHANCE (20%)
+  // No counterattack - defender cannot fire back
+  // Returns: { hits, defRem, defDead, rolls }
+}
+```
+
+### Cargo Orphan Cleanup
+
+When any unit is destroyed, all units aboard it are also removed:
+
+```javascript
+// Player combat (in handleMove):
+newUnits = newUnits.filter(u => u.id !== deadId && u.aboardId !== deadId);
+
+// AI combat (in ai-opponent.js handleCombat):
+s.units = s.units.filter(x => x.id !== deadId && x.aboardId !== deadId);
+```
+
+This applies in: player attacking AI unit, AI attacking player unit, fuel crashes.
+
+---
+
+## Integration Point 5: Carrier Bonus
+
+Carriers gain +1 attack and +1 defense die per 2 fighters aboard:
+
+```javascript
+if (att.carriesAir && allUnits.length > 0) {
+  const fightersAboard = allUnits.filter(u => u.aboardId === attacker.id && u.type === 'fighter').length;
+  const bonusDice = Math.floor(fightersAboard / 2);
+  aRolls += bonusDice;
+}
+// Same for defender carrier
+```
+
+---
+
+## Integration Point 6: AI Turn
+
+```javascript
+import { executeAITurn, recordPlayerObservations } from './ai-opponent.js';
+
+const handleEndTurn = async () => {
+  // 1. Record what AI saw during player's turn (observation symmetry)
+  const updatedKnowledge = recordPlayerObservations(aiKnowledge, playerObservations);
+
+  // 2. Process player end-of-turn (moves reset, production, healing)
+  let newState = endPlayerTurn(gameState);
+
+  // 3. Execute AI turn
+  const { state: aiState, knowledge: newKnowledge, observations, combatEvents } =
+    executeAITurn(newState, updatedKnowledge);
+
+  // 4. Update AI knowledge and observations
+  setAiKnowledge(newKnowledge);
+  setAiObservations(observations);
+  setAiCombatEvents(combatEvents);
+
+  // 5. Check victory conditions
+  const victory = checkVictoryCondition(aiState);
+  if (victory.status !== 'playing') {
+    setPhase(victory.status === 'victory' ? PHASE_VICTORY : PHASE_DEFEAT);
+    setGameState(aiState);
+    return;
+  }
+
+  // 6. Set up player's next turn
+  setGameState(advanceToNextUnit(aiState));
+};
+```
+
+---
+
+## Integration Point 7: GoTo/Patrol Auto-movement
+
+GoTo and Patrol execution uses a step-by-step system driven by React state:
+
+```javascript
+// Set GoTo destination
+const handleSetGoto = (destX, destY) => {
+  const path = findPath(activeUnit.x, activeUnit.y, destX, destY, activeUnit, gameState);
+  if (path) {
+    setGameState(setUnitGoTo(gameState, activeUnit.id, path));
+    setAutoMovingUnitId(activeUnit.id);  // triggers auto-move loop
   }
 };
 
-// Viewport culling (only render visible tiles/units)
-const visibleUnits = gameState.units.filter(u => 
-  u.x >= viewportX && u.x < viewportX + VIEWPORT_TILES_X &&
-  u.y >= viewportY && u.y < viewportY + VIEWPORT_TILES_Y
-);
+// Each render tick: execute one step if auto-moving
+// executeOneAutoMoveStep() handles: arrived, blocked, enemy contact
+// On enemy contact, sets a message and stops auto-movement
 ```
+
+Auto-move uses `findPath` to compute each step toward the current GoTo/Patrol waypoint. The step is validated against `getValidMoves` before execution. If blocked or an enemy is encountered, auto-movement stops and the player is notified.
 
 ---
 
-## Testing Integration
-
-### Integration Test Checklist
-
-- [ ] Map generates and initializes game state
-- [ ] Player can move units with keyboard
-- [ ] Valid moves display correctly
-- [ ] Combat resolves and updates state
-- [ ] Cities can be captured
-- [ ] Production works (units spawn)
-- [ ] Fog of war updates correctly
-- [ ] AI takes full turn
-- [ ] AI units move and capture cities
-- [ ] Turn counter increments
-- [ ] Victory/defeat detection works
-- [ ] GoTo pathfinding executes
-- [ ] Patrol routes work
-- [ ] Dialogs open and save changes
-- [ ] Mini-map navigation works
-- [ ] Viewport scrolling works
-
-### Debug Mode
-
-Add debug overlay for development:
+## Integration Point 8: Bombardment Mode
 
 ```javascript
-const [debugMode, setDebugMode] = useState(false);
+// Entering bombard mode (B key)
+const handleBombardMode = () => {
+  if (activeUnit?.type === 'battleship' && !activeUnit.hasBombarded) {
+    setBombardMode(true);
+  }
+};
 
-// Press D to toggle debug
-useEffect(() => {
-  const handler = (e) => {
-    if (e.key === 'd' && e.ctrlKey) {
-      setDebugMode(prev => !prev);
-    }
-  };
-  window.addEventListener('keydown', handler);
-  return () => window.removeEventListener('keydown', handler);
-}, []);
+// Tile click in bombard mode
+const handleBombard = (targetX, targetY) => {
+  const target = bombardTargets.find(t => t.t === targetX && t.y === targetY);
+  if (!target?.hasEnemy) return; // Only bombard tiles with enemies
 
-{debugMode && (
-  <div style={{ position: 'fixed', top: 0, left: 0, background: 'rgba(0,0,0,0.8)', color: '#0f0', padding: '10px', fontSize: '10px', fontFamily: 'monospace', zIndex: 9999 }}>
-    <div>Turn: {gameState.turn}</div>
-    <div>Active Unit: {activeUnit?.id} ({activeUnit?.type})</div>
-    <div>Units: {gameState.units.length} (Player: {gameState.units.filter(u => u.owner === 'player').length}, AI: {gameState.units.filter(u => u.owner === 'ai').length})</div>
-    <div>Valid Moves: {validMoves.length}</div>
-    <div>Visibility: {currentVisibility.size} tiles</div>
-    <div>Explored: {exploredTiles.size} tiles</div>
-  </div>
-)}
+  const result = resolveBombardment(activeUnit, target.enemyUnit);
+  // Apply damage, mark hasBombarded: true, exit bombard mode
+};
 ```
+
+Bombard mode highlights range-2 tiles with enemies. Bombarding costs the unit's remaining moves (`movesLeft = 0`) and sets `hasBombarded = true` to prevent firing twice.
 
 ---
 
-## Next Steps
+## Integration Point 9: City Production
 
-1. Extract modules from current strategic-conquest-game.jsx
-2. Test each module independently
-3. Wire modules together following this guide
-4. Test integration points one at a time
-5. Add error handling and validation
-6. Optimize performance
-7. Add debug mode for development
+City production is handled by `endPlayerTurn` in `game-state.js`. When a unit completes production, it spawns at the city tile. The player can set production via `CityProductionDialog` which calls `setCityProduction(gameState, cityKey, unitType)`.
+
+---
+
+## Integration Point 10: Save/Load
+
+Save state is serialized to `localStorage` via `SaveGameDialog`. It stores `gameState`, `exploredTiles` (Set converted to array), and `aiKnowledge` (Sets converted to arrays). On load, arrays are converted back to Sets.
+
+---
+
+## Rendering
+
+The viewport renders 24x18 tiles using absolutely-positioned divs. Units are rendered as `UnitSprite` components positioned by `(u.x - viewportX) * TILE_WIDTH, (u.y - viewportY) * TILE_HEIGHT`.
+
+Per-tile stack counting determines the `stackCount` badge:
+
+```javascript
+const tileStack = {};
+const tileTop = {};
+for (const u of visibleUnits) {
+  const k = `${u.x},${u.y}`;
+  tileStack[k] = (tileStack[k] || 0) + 1;
+  tileTop[k] = u.id;  // Last unit wins (active unit sorted last)
+}
+// stackCount is passed to the top unit only
+<UnitSprite stackCount={tileTop[key] === u.id ? tileStack[key] : 0} />
+```
+
+AI observation trails from the previous AI turn are rendered as red SVG lines over the viewport.
+
+---
+
+## Error Handling
+
+- All module calls are defensive: check for null `gameState`, null `activeUnit`, empty paths.
+- AI result is validated before applying to state.
+- If a path is not found, the operation is cancelled with a message to the player.
+- Cargo orphan cleanup (`filter(u => u.aboardId !== deadId)`) prevents ghost units after any unit destruction.

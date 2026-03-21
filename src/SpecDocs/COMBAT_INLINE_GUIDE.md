@@ -1,141 +1,108 @@
-# Actual Combat Code for Inline Use
+# Combat System Reference
 
-## The Real Game Uses This (Only ~30 lines!)
+## Overview
 
-The actual game has a **simple 12-line combat function** plus two small wrappers.
+All combat resolution is handled by inline functions in `strategic-conquest-game-integrated.jsx`. There is no separate combat module. The combat system resolves one outcome per attack — no simulation or pre-calculation.
 
-This is what should be **inlined** in the integrated game:
+---
+
+## Core Combat Functions
+
+### `simulateCombatWithDefender(attacker, defender, allUnits = [])`
+
+Full unit-vs-unit combat. Returns `{ dmgToDef, dmgToAtt, attRem, defRem }`.
 
 ```javascript
-// ============================================================================
-// COMBAT (inline in integrated game)
-// ============================================================================
-// These constants are already in game-constants.js:
-// - BASE_HIT_CHANCE = 0.50
-// - NAVAL_VS_LAND_HIT_CHANCE = 0.33
-// - CITY_COMBAT = { strength: 1, attackRolls: 1, ... }
+function simulateCombatWithDefender(attacker, defender, allUnits = []) {
+  const att = UNIT_SPECS[attacker.type], defSpec = UNIT_SPECS[defender.type];
+  const aStr = attacker.strength, defStr = defender.strength;
+  const aRatio = aStr / att.strength, dRatio = defStr / defSpec.strength;
 
-/**
- * Simulate combat between attacker and defender
- * Returns damage dealt and remaining strength
- */
-function simulateCombat(attackerUnit, defenderSpec, defenderStr) {
-  const att = UNIT_SPECS[attackerUnit.type];
-  const aStr = attackerUnit.strength;
-  const aRatio = aStr / att.strength;
-  const dRatio = defenderStr / defenderSpec.strength;
-  
-  // Calculate attack/defense rolls based on current strength
-  let aRolls = att.halfStrengthCombat 
-    ? Math.max(1, Math.ceil(aStr * 0.5)) 
+  // Base attack/defense rolls, scaled by current health ratio
+  let aRolls = att.halfStrengthCombat
+    ? Math.max(1, Math.ceil(aStr * 0.5))
     : Math.max(1, Math.round(att.attackRolls * aRatio));
-    
-  let dRolls = defenderSpec.halfStrengthCombat 
-    ? Math.max(1, Math.ceil(defenderStr * 0.5)) 
-    : Math.max(0, Math.round(defenderSpec.defenseRolls * dRatio));
-  
-  // Submarine stealth: defender can't attack if not a destroyer
-  if (att.stealth && !defenderSpec.detectsSubs) {
-    dRolls = 0;
+  let dRolls = defSpec.halfStrengthCombat
+    ? Math.max(1, Math.ceil(defStr * 0.5))
+    : Math.max(0, Math.round(defSpec.defenseRolls * dRatio));
+
+  // Carrier bonus: +1 attack/defense die per 2 fighters aboard
+  if (att.carriesAir) {
+    const fightersAboard = allUnits.filter(u => u.aboardId === attacker.id && u.type === 'fighter').length;
+    aRolls += Math.floor(fightersAboard / 2);
   }
-  
-  // Calculate hit chances
-  const aHit = (att.isNaval && defenderSpec.isLand) 
-    ? NAVAL_VS_LAND_HIT_CHANCE 
-    : BASE_HIT_CHANCE;
-    
-  const dHit = (defenderSpec.isLand && att.isNaval) 
-    ? NAVAL_VS_LAND_HIT_CHANCE 
-    : BASE_HIT_CHANCE;
-  
-  // Roll for damage
+  if (defSpec.carriesAir) {
+    const fightersAboard = allUnits.filter(u => u.aboardId === defender.id && u.type === 'fighter').length;
+    dRolls += Math.floor(fightersAboard / 2);
+  }
+
+  // Submarine stealth: defender can't fight back unless it has detectsSubs
+  if (att.stealth && !defSpec.detectsSubs) dRolls = 0;
+
+  // Hit chances
+  const aHit = (att.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
+  const dHit = (defSpec.isLand && att.isNaval) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
+
+  // Roll dice
   let dmgToDef = 0, dmgToAtt = 0;
-  for (let i = 0; i < aRolls; i++) {
-    if (Math.random() < aHit) dmgToDef += att.damagePerHit;
-  }
-  for (let i = 0; i < dRolls; i++) {
-    if (Math.random() < dHit) dmgToAtt += defenderSpec.defenseDamagePerHit;
-  }
-  
-  return { 
-    dmgToDef, 
-    dmgToAtt, 
-    attRem: Math.max(0, aStr - dmgToAtt), 
-    defRem: Math.max(0, defenderStr - dmgToDef) 
-  };
-}
+  for (let i = 0; i < aRolls; i++) if (Math.random() < aHit) dmgToDef += att.damagePerHit;
+  for (let i = 0; i < dRolls; i++) if (Math.random() < dHit) dmgToAtt += defSpec.defenseDamagePerHit;
 
-/**
- * Resolve combat between two units
- */
-function resolveCombat(attUnit, defUnit) {
-  const r = simulateCombat(attUnit, UNIT_SPECS[defUnit.type], defUnit.strength);
-  return { 
-    attDmg: attUnit.strength - r.attRem, 
-    defDmg: defUnit.strength - r.defRem, 
-    attDead: r.attRem <= 0, 
-    defDead: r.defRem <= 0, 
-    attRem: r.attRem, 
-    defRem: r.defRem 
-  };
-}
-
-/**
- * Resolve attack on a city
- */
-function resolveCityAttack(attUnit) {
-  const r = simulateCombat(attUnit, CITY_COMBAT, 1);
-  return { 
-    attDmg: attUnit.strength - r.attRem, 
-    cityDead: r.defRem <= 0, 
-    attRem: r.attRem 
-  };
+  return { dmgToDef, dmgToAtt, attRem: Math.max(0, aStr - dmgToAtt), defRem: Math.max(0, defStr - dmgToDef) };
 }
 ```
 
-**Total: ~30 lines of actual combat logic**
+### `resolveCombat(att, def, allUnits = [])`
 
----
+Wrapper that returns structured result:
 
-## Comparison with Combat Simulator
-
-### combat-simulator.jsx (Testing Tool)
-- **Purpose**: Balance testing, run 100+ simulations
-- **Features**:
-  - `isFirstAttack` parameter (test submarine after revealed)
-  - `isBombard` parameter (battleship range 2 attacks)
-  - Follow-up attack simulation
-  - Detailed statistics (hit counts, rolls, percentages)
-  - Win/loss distribution analysis
-- **Size**: ~200 lines total
-- **Use case**: Game designer testing unit balance
-
-### Original Game Combat (Production Code)
-- **Purpose**: Resolve ONE combat outcome
-- **Features**:
-  - Submarine stealth (always active vs non-destroyers)
-  - Naval vs land penalties (33% vs 50%)
-  - Half-strength combat (carrier/battleship)
-  - Strength-based roll scaling
-- **Size**: ~30 lines total
-- **Use case**: Actual gameplay
-
----
-
-## Verification Against game-constants.js
-
-✅ **Unit specs match exactly:**
-- submarine: `damagePerHit: 4` (4× damage)
-- submarine: `stealth: true`
-- destroyer: `detectsSubs: true`
-- carrier/battleship: `halfStrengthCombat: true`
-- All attack/defense rolls match
-
-✅ **Combat constants exported:**
 ```javascript
-// From game-constants.js lines 189-194
+const resolveCombat = (att, def, allUnits = []) => {
+  const r = simulateCombatWithDefender(att, def, allUnits);
+  return { attDmg, defDmg, attDead: r.attRem <= 0, defDead: r.defRem <= 0, attRem: r.attRem, defRem: r.defRem };
+};
+```
+
+### `resolveCityAttack(att)`
+
+Attack vs empty city (uses `CITY_COMBAT` constant — 1 strength, 1 die, 1 damage):
+
+```javascript
+const resolveCityAttack = (att) => {
+  const r = simulateCombat(att, CITY_COMBAT, 1);
+  return { attDmg, cityDead: r.defRem <= 0, attRem: r.attRem };
+};
+```
+
+---
+
+## Bombardment (`resolveBombardment`)
+
+Battleship range-2 attack. No counterattack. Uses `BOMBARD_HIT_CHANCE` (20%).
+
+```javascript
+function resolveBombardment(attacker, defender) {
+  const aRolls = Math.max(1, Math.ceil(attacker.strength * 0.5));
+  let dmgToDef = 0;
+  for (let i = 0; i < aRolls; i++) {
+    if (Math.random() < BOMBARD_HIT_CHANCE) dmgToDef += att.damagePerHit;
+  }
+  const defRem = Math.max(0, defender.strength - dmgToDef);
+  return { hits: dmgToDef, defRem, defDead: defRem <= 0, rolls: aRolls };
+}
+```
+
+Bombard targets are Chebyshev distance exactly 2 from the battleship. Found via `getBombardTargets()` in `movement-engine.js`. Bombarding consumes all remaining moves and sets `hasBombarded: true` to prevent firing twice per turn.
+
+---
+
+## Combat Constants (from `game-constants.js`)
+
+```javascript
 export const BASE_HIT_CHANCE = 0.50;
 export const NAVAL_VS_LAND_HIT_CHANCE = 0.33;
+export const BOMBARD_HIT_CHANCE = 0.20;
+
 export const CITY_COMBAT = {
   strength: 1,
   attackRolls: 1,
@@ -146,36 +113,127 @@ export const CITY_COMBAT = {
 };
 ```
 
-✅ **Logic matches original game exactly** (lines 295-317 of strategic-conquest-game.jsx)
+---
+
+## Unit Combat Properties (from `UNIT_SPECS`)
+
+| Unit | Strength | AttRolls | DefRolls | DmgPerHit | DefDmgPerHit | Special |
+|------|----------|----------|----------|-----------|--------------|---------|
+| tank | 2 | 2 | 2 | 1 | 1 | |
+| fighter | 1 | 1 | 1 | 1 | 1 | |
+| bomber | 1 | 1 | 0 | 1 | 0 | No defense |
+| transport | 3 | 1 | 1 | 1 | 1 | |
+| destroyer | 4 | 4 | 4 | 1 | 1 | detectsSubs |
+| submarine | 3 | 3 | 3 | **4** | 1 | stealth, 4x attack damage |
+| carrier | 10 | — | — | 1 | 1 | halfStrengthCombat, carriesAir |
+| battleship | 18 | — | — | 1 | 1 | halfStrengthCombat, canBombard |
+
+**halfStrengthCombat**: rolls = `ceil(strength * 0.5)` regardless of attackRolls/defenseRolls fields.
 
 ---
 
-## Recommendation for Phase 3
+## Special Rules
 
-**Inline these 3 functions** (~30 lines total):
-1. `simulateCombat()` - Core combat logic
-2. `resolveCombat()` - Unit vs unit wrapper
-3. `resolveCityAttack()` - Unit vs city wrapper
+### Submarine Stealth
 
-**Do NOT use:**
-- ❌ combat-simulator.jsx (testing tool)
-- ❌ combat-engine.js (unnecessary module)
+When a submarine attacks, the defender gets 0 defense rolls (cannot fight back) unless the defender has `detectsSubs: true` (only destroyers).
 
-**Why inline is better:**
-- Simple (~30 lines)
-- Self-contained
-- Only used in movement/combat execution
-- No extra module needed
+```javascript
+if (att.stealth && !defSpec.detectsSubs) dRolls = 0;
+```
+
+### Carrier Fighter Bonus
+
+For each 2 fighters aboard a carrier, it gains +1 attack roll and +1 defense roll. This is applied in `simulateCombatWithDefender` using `allUnits` (the full game units array).
+
+```javascript
+const fightersAboard = allUnits.filter(u => u.aboardId === carrier.id && u.type === 'fighter').length;
+const bonusDice = Math.floor(fightersAboard / 2);
+// carrier with 4 fighters: +2 attack dice, +2 defense dice
+```
+
+### Naval vs Land
+
+Naval units attacking land units (or defending against land units while at sea) have a reduced 33% hit chance instead of 50%.
+
+```javascript
+const aHit = (att.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
+const dHit = (defSpec.isLand && att.isNaval) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
+```
+
+### Strength-Scaled Rolls
+
+Attack and defense rolls scale with current strength ratio (simulates attrition):
+
+```javascript
+aRolls = Math.max(1, Math.round(att.attackRolls * (currentStrength / maxStrength)));
+```
+
+Exception: units with `halfStrengthCombat` (carrier, battleship) always use `ceil(strength * 0.5)` regardless.
 
 ---
 
-## Updated Phase 3 Target
+## Cargo Orphan Cleanup
 
-With ~30 lines of combat code inline:
-- ~30 lines: Combat functions (inline)
-- ~300-400 lines: Orchestration, hooks, handlers, rendering
-- ~100 lines: Menu screen (keep inline or extract later)
+When any unit is destroyed (player attacks AI, AI attacks player, fuel crash), all units aboard the destroyed unit are also removed:
 
-**Total: ~430-530 lines** ✅ (well within 600 line maximum)
+```javascript
+// Player combat (in handleMove):
+newUnits = newUnits.filter(u => u.id !== deadId && u.aboardId !== deadId);
 
-Much better than trying to use the 200+ line combat simulator!
+// AI combat (in ai-opponent.js):
+s.units = s.units.filter(x => x.id !== deadId && x.aboardId !== deadId);
+
+// Fuel crash (in the fuel depletion handler):
+newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
+```
+
+---
+
+## AI Combat Decision (EV Model)
+
+The AI uses `evaluateCombat()` from `ai-helpers.js` to decide whether to initiate combat. It does NOT use the dice-roll `simulateCombat` function for planning — instead it uses a deterministic expected-value model:
+
+```javascript
+// Effective damage per round (expected value)
+const effAttack  = attRolls * 0.5 * attSpec.damagePerHit;
+const effDefense = defCanFightBack ? defRolls * 0.5 * defSpec.defenseDamagePerHit : 0;
+
+// Rounds to kill each side
+const roundsToKillDef = defender.strength / effAttack;
+const roundsToKillAtt = effDefense > 0 ? attacker.strength / effDefense : Infinity;
+
+// Win probability approximation
+const winProb = roundsToKillAtt === Infinity
+  ? 1.0
+  : roundsToKillAtt / (roundsToKillDef + roundsToKillAtt);
+
+// Net expected value
+const netEV = winProb * defenderValue - (1 - winProb) * attackerValue;
+
+// Accept combat if EV is above threshold
+const shouldAttack = netEV > -attackerValue * 0.15;
+// Near friendly city: looser threshold
+// netEV > -attackerValue * 0.35 is also accepted
+```
+
+**Value calculation:**
+
+- `attackerValue` = full replacement cost (`productionDays`) + cargo value (each unit aboard contributes its own `productionDays`)
+- `defenderValue` = health-discounted (`productionDays * strength / maxStrength`) + cargo value
+
+This causes the AI to correctly avoid bad fights (e.g. fighter vs destroyer: ~6% win, large negative EV) while taking good ones (e.g. destroyer vs fighter: ~89% win, large positive EV).
+
+---
+
+## Example Combat Outcomes
+
+| Attacker | Defender | Win Probability | Typical Result |
+|----------|----------|----------------|----------------|
+| Tank (full) | Tank (full) | 50% | Even fight |
+| Destroyer | Fighter | ~89% | Destroyer wins |
+| Fighter | Destroyer | ~6% | Fighter loses |
+| Submarine | Transport | ~100% (stealth) | Sub wins, transport sunk with all cargo |
+| Submarine | Destroyer | 50% (no stealth bonus) | Even fight |
+| Carrier (4 fighters) | Battleship | Improved | +2 attack/+2 defense dice for carrier |
+| Battleship (bombard) | Any unit | 20% per roll | 1-9 rolls at 20%, no counterattack |

@@ -2,15 +2,14 @@
 
 ## Document Status
 
-**Last Updated**: Current session  
-**Matches Implementation**: `ai-opponent.js`  
-**Status**: Active - implementation is source of truth
+**Matches Implementation**: `ai-opponent.js`, `ai-helpers.js`, `ai-tactical-manager.js`
+**Status**: Active — implementation is source of truth
 
 ---
 
 ## Overview
 
-The AI opponent uses a **phase-based strategy** with **target unit distributions**, **tactical threat response**, and a **strict priority hierarchy** for unit decisions. The AI maintains its own fog of war and knowledge state separate from the player.
+The AI opponent uses a **phase-based strategy** with **target unit distributions**, **tactical threat response**, and a **strict priority hierarchy** for unit decisions. The AI maintains its own fog of war and knowledge state separate from the player. Combat assessment uses an EV (expected value) model.
 
 ---
 
@@ -20,96 +19,87 @@ The AI opponent uses a **phase-based strategy** with **target unit distributions
 
 ```javascript
 export const PHASE = {
-  LAND: 'land_phase',      // Exploring home island with tanks
-  TRANSITION: 'transition', // Building naval/air capability  
-  NAVAL: 'naval_phase',    // Active expansion to other islands
-  LATE_GAME: 'late_game'   // Final push for victory
+  LAND: 'land_phase',
+  TRANSITION: 'transition',
+  NAVAL: 'naval_phase',
+  LATE_GAME: 'late_game'
 };
 ```
 
 ### Phase Transition Triggers
 
-| From       | To         | Trigger                                                           |
-| ---------- | ---------- | ----------------------------------------------------------------- |
-| LAND       | TRANSITION | 90% home island explored **AND** all visible home cities captured |
-| LAND       | TRANSITION | (Fallback) 100% home island explored                              |
-| LAND       | TRANSITION | (Edge case) 5%+ map explored AND 2+ cities                        |
-| TRANSITION | NAVAL      | Player contact OR 40% map explored                                |
-| NAVAL      | LATE_GAME  | <10% neutral cities OR 60% city control OR 2x unit strength       |
-
-### Implementation
-
-```javascript
-if (k.explorationPhase === PHASE.LAND) {
-  if (homeExp >= 0.90 && homeCitiesCaptured) {
-    return PHASE.TRANSITION;  // Primary trigger
-  }
-  if (homeExp >= 1.0) {
-    return PHASE.TRANSITION;  // Fallback
-  }
-}
-```
-
-The `homeCitiesCaptured` check ensures AI doesn't prematurely transition if a city on the home island remains uncaptured.
+| From | To | Trigger |
+|------|-----|---------|
+| LAND | TRANSITION | All home island cities captured (primary) |
+| LAND | TRANSITION | 90% home explored + cities captured |
+| LAND | TRANSITION | (Fallback) 100% home explored |
+| LAND | TRANSITION | (Edge case) 5%+ map AND 2+ cities |
+| TRANSITION | NAVAL | Player contact OR 40% map explored |
+| NAVAL | LATE_GAME | <10% neutral cities OR 60% city control OR 2x strength |
 
 ---
 
 ## Target Unit Distributions
 
-### Distribution by Phase
-
 ```javascript
 const TARGET_DIST = {
-  [PHASE.LAND]: { 
-    tank: 1.00  // 100% tanks - maximize city capture
+  [PHASE.LAND]: {
+    tank: 1.00
   },
-
-  [PHASE.TRANSITION]: { 
-    tank: 0.50,      // 50% - ground forces for invasion
-    transport: 0.18, // 20% - critical for expansion
-    destroyer: 0.15, // 15% - naval escort and exploration
-    fighter: 0.17    // 15% - scouting and patrol
+  [PHASE.TRANSITION]: {
+    tank: 0.50, transport: 0.18, fighter: 0.17, destroyer: 0.15
   },
-
-  [PHASE.NAVAL]: { 
-    tank: 0.50,       // 50% - 6 tanks per transport, tanks build fast
-    fighter: 0.15,    // 15%
-    destroyer: 0.13,  // 13%
-    transport: 0.12,  // 12%
-    battleship: 0.04, // 4%
-    carrier: 0.03,    // 3%
-    submarine: 0.03   // 3%
-    // NOTE: No bomber in naval phase
+  [PHASE.NAVAL]: {
+    tank: 0.50, destroyer: 0.13, fighter: 0.15, transport: 0.12,
+    battleship: 0.04, carrier: 0.03, submarine: 0.03
   },
-
-  [PHASE.LATE_GAME]: { 
-    tank: 0.35,       // 35% - reduced for bombers
-    destroyer: 0.18,  // 18%
-    fighter: 0.15,    // 15%
-    transport: 0.10,  // 10%
-    battleship: 0.08, // 8%
-    bomber: 0.05,     // 5% - only in late game
-    carrier: 0.05,    // 5%
-    submarine: 0.04   // 4%
+  [PHASE.LATE_GAME]: {
+    tank: 0.35, destroyer: 0.18, fighter: 0.15, transport: 0.10,
+    bomber: 0.05, battleship: 0.08, carrier: 0.05, submarine: 0.04
   }
 };
 ```
 
-### Why 50% Tanks?
-
-- Each transport carries 6 tanks
-- Tanks build in 4 days; transports in 10 days
-- Tanks needed for defense and conquest
-
-### Fractional Unit Counting
-
-In-progress production counts as fractional units to prevent all cities from building the same thing:
+Bombers only appear in LATE_GAME. Fractional unit counting prevents all cities building the same type:
 
 ```javascript
 // 2/4 days progress on a tank = 0.5 units in distribution calculation
-const fraction = progress / spec.productionDays;
-counts[city.producing] += fraction;
+counts[city.producing] += (progress / spec.productionDays);
 ```
+
+---
+
+## EV-Based Combat Model
+
+The AI uses an expected-value model to evaluate combat, replacing older type-specific win/loss tables. See `evaluateCombat()` in `ai-helpers.js`.
+
+**Core formula:**
+
+```
+effAttack  = attRolls * 0.5 * damagePerHit
+effDefense = defRolls * 0.5 * defenseDamagePerHit  (0 if stealth vs non-detector)
+
+roundsToKillDef = defender.strength / effAttack
+roundsToKillAtt = attacker.strength / effDefense  (Infinity if defender can't retaliate)
+
+winProb = roundsToKillAtt / (roundsToKillDef + roundsToKillAtt)
+netEV   = winProb * defenderValue - (1 - winProb) * attackerValue
+```
+
+**Thresholds:**
+
+- Standard: `netEV > -attackerValue * 0.15`
+- Near friendly city (dist <= 3): `netEV > -attackerValue * 0.35`
+
+**Why this correctly prevents bad fights:**
+
+Fighter (attRolls=1, hp=1) vs Destroyer (defRolls=4, hp=4):
+- winProb = 0.5 / (8 + 0.5) = ~6%
+- netEV = 0.06*8 - 0.94*6 = -5.1 — well below threshold, correctly declines
+
+Destroyer (attRolls=4, hp=4) vs Fighter (defRolls=1, hp=1):
+- winProb = 0.5 / (4 + 0.5) = ~89%
+- netEV = 0.89*6 - 0.11*8 = +4.5 — correctly attacks
 
 ---
 
@@ -117,21 +107,17 @@ counts[city.producing] += fraction;
 
 ### Threat Detection
 
-Each turn, the AI scans visible tiles for threats:
-
 ```javascript
 const threats = {
-  playerTransports: [],      // HIGH PRIORITY - invasion threat
-  playerNavalCombat: [],     // Destroyers, subs, battleships, carriers
-  playerFighters: [],        // Opportunity targets (reduce player intel)
-  playerBombers: [],         // Air threat
-  threatenedCities: []       // AI cities that may be under attack
+  playerTransports: [],       // HIGH PRIORITY - invasion threat
+  playerNavalCombat: [],      // Destroyers, subs, battleships, carriers
+  playerFighters: [],         // Opportunity targets
+  playerBombers: [],          // Air threat
+  threatenedCities: []        // AI cities within 8 tiles of player transport
 };
 ```
 
 ### Transport Threat Range
-
-When a player transport is spotted within 8 tiles of an AI coastal city, that city is flagged as threatened:
 
 ```javascript
 if (dist <= AI_CONFIG.tactical.transportThreatRange) {  // 8 tiles
@@ -141,174 +127,112 @@ if (dist <= AI_CONFIG.tactical.transportThreatRange) {  // 8 tiles
 
 ---
 
-## Unit-Specific Tactical Behaviors
-
-### Naval Combat Units (Destroyer, Submarine, Battleship, Carrier)
-
-**Priority 1: Hunt Player Transports**
-
-- Transports represent major invasion threats (potentially 6 tanks)
-- All naval combat units will target the nearest visible player transport
-
-```javascript
-if (threats.playerTransports.length > 0) {
-  const nearestTransport = findNearest(unit, threats.playerTransports);
-  return { type: 'goto', target: nearestTransport, reason: 'hunt_transport' };
-}
-```
-
-**Priority 2: Opportunistically Target Fighters**
-
-- Killing player fighters reduces player intelligence
-- Only engage if within 2 tiles (don't chase across map)
-- Submarines don't engage fighters (they can't attack air)
-
-```javascript
-if (threats.playerFighters.length > 0 && unit.type !== 'submarine') {
-  const nearestFighter = findNearest(unit, threats.playerFighters);
-  if (dist <= 4) {
-    return { type: 'goto', target: nearestFighter, reason: 'hunt_fighter' };
-  }
-}
-```
-
-### Fighters
-
-**Behavior Split: 70% Scout, 30% Patrol**
-
-```javascript
-const shouldScout = Math.random() < 0.70;
-```
-
-**Scouting (70%)**
-
-- Find the FARTHEST unexplored tile that can be reached AND returned from
-- Maximizes exploration per turn
-- Uses fuel-aware pathfinding
-
-**Patrol (30%)**
-
-- Circle around AI coastal cities at 3-6 tile radius
-- Detects incoming threats before they reach cities
-- Provides early warning for transport invasions
-
-**Emergency Intercept**
-
-- If a player transport threatens an AI city AND no naval units can intercept, fighters will attack
-- Transports are high-value targets (up to 6 tanks)
-- Otherwise, fighters are too valuable as scouts to risk
-
-```javascript
-if (threats.threatenedCities.length > 0) {
-  const intercept = canInterceptWithNaval(urgentThreat.threat, gs);
-  if (!intercept.canIntercept && urgentThreat.distance <= 4) {
-    return { type: 'goto', target: urgentThreat.threat, reason: 'emergency_intercept' };
-  }
-}
-```
+## Unit-Specific Behaviors
 
 ### Transports
 
-**Threat Avoidance**
+**Threat avoidance (two layers):**
 
-- When routing to destinations, apply penalty scores to paths near enemy naval units
-- Prefer routes that avoid destroyers, subs, battleships, carriers
-- Within 3 tiles: +100 penalty; Within 5 tiles: +50 penalty
+1. Proactive: `getMoveToward()` uses `getNavalDangerZone()` as `avoidTiles` (cost penalty 20x for danger tiles)
+2. Reactive: When within 3 tiles of any enemy combat ship, abort mission and flee to nearest AI city
 
 ```javascript
-for (const threat of nearbyThreats) {
-  const threatDist = manhattanDistance(nx, ny, threat.unit.x, threat.unit.y);
-  if (threatDist < 3) threatPenalty += 100;
-  else if (threatDist < 5) threatPenalty += 50;
+const nearbyThreats = threats.playerNavalCombat.filter(t =>
+  manhattanDistance(unit.x, unit.y, t.x, t.y) <= 3
+);
+if (nearbyThreats.length > 0) {
+  return { action: 'move_toward', target: nearestAiCity, reason: 'transport_evade_threat' };
 }
-const score = -dist - threatPenalty;  // Pick highest score
 ```
 
-**Auto-Loading**
+**Combat rules:**
+- Never attack with cargo aboard
+- Never attack when damaged
+- Full health, empty: only attack fighters (acceptable 1-die risk)
 
-- When a transport moves adjacent to tanks on land, automatically load them
-- No manual boarding required
-- Loads up to capacity (6 tanks)
+### Naval Combat Units (Destroyer, Submarine, Battleship, Carrier)
+
+Priority order during mission assignment:
+1. Hunt player transports (highest value, invasion threat)
+2. Escort AI transports
+3. Defend threatened AI cities
+4. Patrol AI territory
+
+Carriers with fighters get a combat bonus applied during combat resolution in the main game file (not in the AI's own `evaluateCombat`).
+
+### Fighters
+
+Phase-dependent patrol split:
+
+```javascript
+fighterPatrolByPhase: {
+  land_phase: 0.00,    // All scout
+  transition: 0.00,    // All scout
+  naval_phase: 0.25,   // 75% scout, 25% patrol
+  late_game: 0.50      // 50% scout, 50% patrol
+}
+```
+
+Scouting uses `findDeepScoutTarget()` — finds the farthest unexplored area that can be reached AND returned from within current fuel. Patrolling circles AI coastal cities.
+
+Emergency intercept: if a player transport threatens a city and no naval unit can reach it in time, fighters will attack.
 
 ### Tanks
 
-**Threat Response**
+Priority order:
+1. Defend threatened cities (if reachable by land flood-fill)
+2. Capture neutral/player cities
+3. Recapture lost cities
+4. Explore land
+5. Garrison (maintain 1 tank per city)
+6. Stage at coastal cities (TRANSITION/NAVAL phases)
+7. Attack player cities
 
-- When a player transport is detected threatening an AI city, nearby tanks move to defend
-- Only responds if the city is reachable by land (same island)
-- Takes priority over staging behavior
-
-```javascript
-if (threats.threatenedCities.length > 0 && spec.isLand) {
-  const nearestThreat = threats.threatenedCities
-    .filter(t => reachableLand.has(`${t.city.x},${t.city.y}`))
-    .sort((a, b) => a.distance - b.distance)[0];
-
-  if (nearestThreat && nearestThreat.distance <= 6) {
-    return { type: 'goto', target: nearestThreat.city, reason: 'defend_from_transport' };
-  }
-}
-```
-
-**Coastal Staging**
-
-- In TRANSITION/NAVAL phases, tanks at coastal cities WAIT for transport
-- Don't wander off to garrison inland cities
-- Allows efficient transport loading
-
-**Reachability Check**
-
-- Before assigning any target, verify it's reachable by land (flood-fill)
-- Prevents tanks from repeatedly trying to path across water
+Reachability is verified via `floodFillLand()` before assigning any target.
 
 ---
 
 ## Priority System
 
-### Unit Decision Priority Order
+| Priority | Name | Applies To | Description |
+|----------|------|-----------|-------------|
+| P0 | Fuel Critical | Aircraft | Return to refuel immediately |
+| P0.5 | Transport Evade | Transport | Flee enemy naval within 3 tiles |
+| TACTICAL | Hunt Transport | Naval Combat | Attack visible player transports |
+| TACTICAL | Escort AI Transport | Destroyer | Stay with AI transport |
+| TACTICAL | Defend City | Tank | Move to threatened coastal city |
+| P1 | Capture City | Tank | Capture neutral/player cities |
+| P1.5 | Recapture | Tank | Retake player-owned cities |
+| P2 | Explore | All | Find more of the map |
+| P3 | Garrison | Tank | Maintain 1 tank per city |
+| P3.5 | Staging | Tank | Move to coastal cities for transport |
+| P4 | Attack | Tank | Strike player cities |
+| P5 | Default | All | Explore or wait |
 
-| Priority | Name                | Applies To      | Description                          |
-| -------- | ------------------- | --------------- | ------------------------------------ |
-| P0       | Fuel Critical       | Aircraft        | Must return to refuel immediately    |
-| TACTICAL | Hunt Transport      | Naval Combat    | Attack visible player transports     |
-| TACTICAL | Hunt Fighter        | Naval (not sub) | Opportunistic attack within 4 tiles  |
-| TACTICAL | Emergency Intercept | Fighter         | Attack transport if no naval can     |
-| TACTICAL | Defend City         | Tank            | Move to threatened coastal city      |
-| P1       | Capture Neutral     | Tank            | Take known neutral cities            |
-| P1.5     | Recapture Lost      | Tank            | Retake cities lost to player         |
-| P2       | Explore             | All             | Find more of the map                 |
-| P3       | Garrison            | Tank            | Maintain 1 tank per city             |
-| P3.5     | Staging             | Tank            | Move to coastal cities for transport |
-| P4       | Attack              | Tank            | Strike player cities                 |
-| P5       | Default             | All             | Explore or wait                      |
+---
+
+## Cargo Orphan Cleanup
+
+When a unit is destroyed, all units aboard it are removed from the game. This applies whether the destroyer is AI or player, and in fuel crashes:
+
+```javascript
+// In ai-opponent.js handleCombat:
+s.units = s.units.filter(x => x.id !== deadId && x.aboardId !== deadId);
+```
+
+Same pattern in the player combat handler and fuel crash handler in `strategic-conquest-game-integrated.jsx`.
 
 ---
 
 ## AI Observation Reports (Symmetry)
 
-### The Principle
-
-If the player gets reports about AI movements they observed, the AI should get equivalent information about player movements it observed.
-
-### Implementation
-
-**Recording Observations**
+The AI records what it observed during its turn (unit movements near player units/cities). The player sees these as red trail overlays in the AI Turn Summary dialog. Symmetrically, the player's movements that were observed by AI units are recorded and passed to the AI before its next turn.
 
 ```javascript
 export function recordPlayerObservations(k, observations) {
-  // Called from main game after player turn
-  // observations = [{ unitType, trail, ... }]
-  const newK = { ...k, lastTurnObservations: observations };
-  return newK;
+  return { ...k, lastTurnObservations: observations };
 }
 ```
-
-**Integration Point**
-The main game file (`strategic-conquest-game-integrated.jsx`) should:
-
-1. Track what AI units saw during player movement (similar to how player observations are tracked)
-2. Call `recordPlayerObservations(k, observations)` before the AI turn
-3. AI can then factor this into tactical decisions
 
 ---
 
@@ -317,26 +241,23 @@ The main game file (`strategic-conquest-game-integrated.jsx`) should:
 ```javascript
 export const AI_CONFIG = {
   exploration: {
-    homeComplete: 0.90,        // 90% home island explored (was 100%)
-    navalMapThreshold: 0.40,   // 40% map explored → NAVAL
-    lateNeutral: 0.10,         // <10% neutral cities → LATE_GAME
-    lateCityControl: 0.60,     // 60% city control → LATE_GAME
-    lateStrength: 2.0          // 2x unit strength → LATE_GAME
+    homeComplete: 0.90,      // 90% home island explored (+ all cities captured = TRANSITION)
+    navalMapThreshold: 0.40, // 40% map explored -> NAVAL
+    lateNeutral: 0.10,
+    lateCityControl: 0.60,
+    lateStrength: 2.0
   },
-
   fuel: {
-    fighterReturn: 0.40,       // Return at 40% fuel (8/20)
-    bomberReturn: 0.30         // Return at 30% fuel (9/30)
+    fighterReturn: 0.35,     // Return at 35% fuel remaining
+    bomberReturn: 0.30
   },
-
   defense: {
-    garrisonPerCity: 1         // Minimum tanks per city
+    garrisonPerCity: 1       // Minimum tanks per city
   },
-
   tactical: {
-    fighterScoutPriority: 0.70,   // 70% scout, 30% patrol
-    transportThreatRange: 8,       // Tiles at which transport triggers alert
-    navalThreatRange: 5            // Range for naval threat avoidance
+    fighterPatrolByPhase: { land_phase: 0, transition: 0, naval_phase: 0.25, late_game: 0.50 },
+    transportThreatRange: 8, // Tiles at which transport triggers city alert
+    navalThreatRange: 5      // Range for naval danger zone calculation
   }
 };
 ```
@@ -346,75 +267,41 @@ export const AI_CONFIG = {
 ## AI Knowledge State
 
 ```javascript
-function createAIKnowledge(startX, startY) {
-  return {
-    // Exploration
-    exploredTiles: new Set(),       // "x,y" strings
-    startPosition: { x, y },        // AI's initial city
-    homeIslandTiles: null,          // Cached flood-fill result
-    homeIslandCities: new Set(),    // Cities discovered on home island
-    explorationPhase: PHASE.LAND,
-
-    // Player contact
-    hasSeenPlayerUnit: false,
-    hasSeenPlayerCity: false,
-
-    // Strategic tracking
-    lostCities: new Set(),          // Cities we owned that player took
-
-    // Observation symmetry
-    lastTurnObservations: []        // What AI saw during player's turn
-  };
+{
+  exploredTiles: Set<"x,y">,
+  startPosition: { x, y } | null,
+  explorationPhase: PHASE.LAND | TRANSITION | NAVAL | LATE_GAME,
+  hasSeenPlayerUnit: boolean,
+  hasSeenPlayerCity: boolean,
+  homeIslandTiles: Set<"x,y"> | null,     // Flood-filled from start position
+  homeIslandCities: Set<"x,y">,
+  lostCities: Set<"x,y">,
+  lastTurnObservations: any[],
+  knownCities: Set<"x,y">,
+  islands: IslandRecord[],                // Partial island tracking
 }
 ```
 
-### Knowledge Update Timing
-
-Knowledge is updated **twice per AI turn**:
-
-1. At turn start (see current visibility)
-2. After movements (scouts may have discovered new areas)
-
-Contact made during movement can trigger immediate phase transitions.
+Knowledge is updated twice per turn: at turn start (current visibility) and after movements (scouts may have discovered new areas).
 
 ---
 
 ## Turn Execution Flow
 
-```javascript
-function executeAITurn(gameState, knowledge) {
-  // 1. Update knowledge
-  k = updateAIKnowledge(knowledge, state);
-
-  // 2. Detect threats (transports, naval, etc.)
-  const threats = detectThreats(state, k);
-
-  // 3. Check phase transitions
-  k.explorationPhase = determinePhase(k, state);
-
-  // 4. Handle production
-  state = handleProduction(state, k, turnLog);
-
-  // 5. Reset unit moves, heal, refuel
-  state.units = resetAIUnits(state);
-
-  // 6. Decide actions (with threat awareness)
-  for (const unit of aiUnits) {
-    const action = decideUnitAction(unit, state, k, threats);
-    if (action.type === 'goto') setPath(unit, action.target);
-  }
-
-  // 7. Execute movements
-  state = executeMovementsWithObservations(state, turnLog);
-
-  // 8. Update knowledge again (post-movement discovery)
-  k = updateAIKnowledge(k, state);
-
-  // 9. Re-check phase if contact made
-  if (newContact) k.explorationPhase = determinePhase(k, state);
-
-  return { state, knowledge: k };
-}
+```
+executeAITurn(gameState, knowledge)
+  1. updateAIKnowledge()         - what AI sees now
+  2. detectThreats()             - player transports, naval, air threats
+  3. determinePhase()            - check for phase transitions
+  4. planProduction()            - update city production
+  5. resetAIUnits()              - restore moves, fuel, heal at cities
+  6. allocateUnits()             - split between exploration/tactical
+  7. assignExplorationMissions() - exploration manager
+  8. assignTacticalMissions()    - tactical manager
+  9. executeStepByStepMovements()- move all units (highest movesLeft first)
+  10. updateAIKnowledge()        - post-movement discovery
+  11. re-check phase if contact  - immediate phase transition if player found
+  return { state, knowledge, observations, combatEvents }
 ```
 
 ---
@@ -422,50 +309,17 @@ function executeAITurn(gameState, knowledge) {
 ## Debug Logging
 
 ```javascript
+// Master switches in ai-helpers.js
 const DEBUG = true;
-const DEBUG_PROD = true;      // Production decisions
-const DEBUG_PHASE = true;     // Phase transitions
-const DEBUG_TACTICAL = true;  // Threat detection and response
-
-// Example output:
-// [AI][TACTICAL] Detected 1 player transports
-// [AI][TACTICAL] THREAT: Transport at (15,8) threatens city (12,10), dist=5
-// [AI][destroyer@10,12] TACTICAL: Targeting player transport at (15,8), dist=5
-// [AI][fighter@12,10] Patrolling to (15,13) near city (12,10)
+const DEBUG_PHASE = true;
+const DEBUG_MISSIONS = true;
 ```
 
----
-
-## File Naming
-
-The AI module is now `ai-opponent.js` (no version number).
-
-**Required change in strategic-conquest-game-integrated.jsx:**
-
-```javascript
-// Change from:
-import { executeAITurn, createAIKnowledge } from './ai-opponent-v2.js';
-
-// To:
-import { executeAITurn, createAIKnowledge } from './ai-opponent.js';
+Example output:
 ```
-
----
-
-## Changelog
-
-| Version | Changes                                                                                                       |
-| ------- | ------------------------------------------------------------------------------------------------------------- |
-| v1      | Initial spec                                                                                                  |
-| v2      | Tank staging, transport auto-loading, fractional production                                                   |
-| Current | Tactical threat response, 90%+cities phase trigger, fighter patrol, transport avoidance, observation symmetry |
-
----
-
-## Future Improvements
-
-1. **Coordinated attacks**: Multi-unit assault planning
-2. **Combat evaluation**: Estimate win probability before engaging  
-3. **Naval task forces**: Group destroyers with transports for escort
-4. **Bomber targeting**: Target high production value groupings of enemies (large stacks of tanks, battleships, carriers).  A bomber's target should be >>30 days worth of production unless a lesser target could change a pivotal battle opportunity.
-5. **Adaptive difficulty**: Scale AI aggressiveness based on game state
+[AI][PHASE] Check: phase=land_phase, homeExp=97.2%, homeCitiesCaptured=true
+[AI][PHASE] LAND -> TRANSITION: All 4 home cities captured (homeExp=97%)
+[AI][TACTICAL] Detected 1 player transports
+[AI][TACTICAL] 2 cities under threat
+[AI][MISSION] transport#14@(22,15): ferry_invasion(30,12) - ferry to known city
+```

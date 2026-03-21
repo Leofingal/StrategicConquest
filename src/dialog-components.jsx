@@ -6,6 +6,8 @@ import {
   COLORS
 } from './game-constants.js';
 import { SYMBOLS } from './ui-symbols.js';
+import startingConditionsText from './SpecDocs/HELP_STARTING_CONDITIONS.md?raw';
+import unitGuideText from './SpecDocs/HELP_UNIT_GUIDE.md?raw';
 
 // Import sprite configuration for image-based icons
 import { SPRITE_CONFIG, USE_IMAGE_SPRITES } from './sprite-config.js';
@@ -245,6 +247,7 @@ export function CityProductionDialog({
 }) {
   const [selProd, setSelProd] = useState(city.producing || 'tank');
   const [selUnit, setSelUnit] = useState(null);
+  const [showHelp, setShowHelp] = useState(false);
   const isCoastal = isAdjacentToWater(city.x, city.y, map, width, height);
   const cityUnits = units.filter(u => {
     const pos = getUnitLocation(u, units);
@@ -286,16 +289,21 @@ export function CityProductionDialog({
         width: 500, 
         boxShadow: '0 4px 20px rgba(0,0,0,0.5)' 
       }}>
-        <div style={{ 
-          backgroundColor: COLORS.border, 
-          padding: '8px 12px', 
-          fontSize: 12, 
-          fontWeight: 600, 
-          letterSpacing: 1, 
-          textTransform: 'uppercase' 
+        <div style={{
+          backgroundColor: COLORS.border,
+          padding: '8px 12px',
+          fontSize: 12,
+          fontWeight: 600,
+          letterSpacing: 1,
+          textTransform: 'uppercase',
+          display: 'flex',
+          justifyContent: 'space-between',
+          alignItems: 'center',
         }}>
-          City Production - ({city.x}, {city.y})
+          <span>City Production - ({city.x}, {city.y})</span>
+          <button onClick={() => setShowHelp(true)} title="Unit & Combat Guide" style={{ background: 'none', border: `1px solid ${COLORS.textMuted}`, color: COLORS.textMuted, fontSize: 10, cursor: 'pointer', borderRadius: '50%', width: 18, height: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold', flexShrink: 0 }}>?</button>
         </div>
+        {showHelp && <HelpDialog title="Unit & Combat Guide" guide="units" onClose={() => setShowHelp(false)} />}
         
         {/* 7x7 MINIMAP HEADER - BUG #9 FIX */}
         <div style={{ padding: 12, borderBottom: `1px solid ${COLORS.border}`, display: 'flex', gap: 12, alignItems: 'center' }}>
@@ -714,7 +722,8 @@ export function AllUnitsListDialog({
 }) {
   const [selUnit, setSelUnit] = useState(null);
   const [hoveredUnit, setHoveredUnit] = useState(null);
-  
+  const [showHelp, setShowHelp] = useState(false);
+
   const playerUnits = units.filter(u => u.owner === 'player');
   const selectedUnitData = selUnit ? playerUnits.find(u => u.id === selUnit) : null;
   
@@ -770,20 +779,24 @@ export function AllUnitsListDialog({
           justifyContent: 'space-between' 
         }}>
           <span>All Units - Player ({playerUnits.length} total)</span>
-          <button 
-            onClick={onClose} 
-            style={{ 
-              background: 'none', 
-              border: 'none', 
-              color: COLORS.textMuted, 
-              fontSize: 14, 
-              cursor: 'pointer' 
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <button onClick={() => setShowHelp(true)} title="Unit & Combat Guide" style={{ background: 'none', border: `1px solid ${COLORS.textMuted}`, color: COLORS.textMuted, fontSize: 10, cursor: 'pointer', borderRadius: '50%', width: 18, height: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 'bold' }}>?</button>
+            <button
+            onClick={onClose}
+            style={{
+              background: 'none',
+              border: 'none',
+              color: COLORS.textMuted,
+              fontSize: 14,
+              cursor: 'pointer'
             }}
           >
             X
           </button>
+          </div>
         </div>
-        
+        {showHelp && <HelpDialog title="Unit & Combat Guide" guide="units" onClose={() => setShowHelp(false)} />}
+
         {/* MINIMAP AND INFO PANEL - shows selected/hovered unit */}
         {selectedUnitData && (
           <div style={{ padding: 12, borderBottom: `1px solid ${COLORS.border}`, display: 'flex', gap: 12, alignItems: 'center' }}>
@@ -2493,6 +2506,163 @@ export function LoadGameDialog({ onLoad, onClose }) {
           >
             Load Game
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// HELP DIALOG
+// ============================================================================
+
+function parseInline(text) {
+  // Split on **bold** and bare URLs
+  const parts = text.split(/(\*\*[^*]+\*\*|https?:\/\/\S+)/);
+  if (parts.length === 1) return text;
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('http://') || part.startsWith('https://')) {
+      return <a key={i} href={part} target="_blank" rel="noreferrer" style={{ color: '#88c0d0' }}>{part}</a>;
+    }
+    return part || null;
+  });
+}
+
+function isSeparatorRow(line) {
+  return line.split('|').slice(1, -1).every(cell => /^\s*:?-+:?\s*$/.test(cell));
+}
+
+function parseMarkdown(text) {
+  const lines = text.split('\n');
+  const elements = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (trimmed === '') { i++; continue; }
+
+    // Horizontal rule (--- on its own line)
+    if (/^-{3,}$/.test(trimmed)) {
+      elements.push(<hr key={i} style={{ border: 'none', borderTop: '1px solid #444', margin: '12px 0' }} />);
+      i++; continue;
+    }
+
+    // H3 before H2/H1 to avoid prefix collision
+    if (trimmed.startsWith('### ')) {
+      elements.push(<div key={i} style={{ fontSize: 12, color: '#a8c8a8', fontWeight: 'bold', margin: '10px 0 3px' }}>{parseInline(trimmed.slice(4))}</div>);
+      i++; continue;
+    }
+    if (trimmed.startsWith('## ')) {
+      elements.push(<div key={i} style={{ fontSize: 14, color: '#88c0d0', fontWeight: 'bold', margin: '14px 0 5px', borderBottom: '1px solid #333', paddingBottom: 3 }}>{parseInline(trimmed.slice(3))}</div>);
+      i++; continue;
+    }
+    if (trimmed.startsWith('# ')) {
+      elements.push(<div key={i} style={{ fontSize: 17, color: '#f0c060', fontWeight: 'bold', margin: '0 0 12px', letterSpacing: 1 }}>{parseInline(trimmed.slice(2))}</div>);
+      i++; continue;
+    }
+
+    // Table
+    if (trimmed.startsWith('|')) {
+      const tableLines = [];
+      while (i < lines.length && lines[i].trim().startsWith('|')) {
+        tableLines.push(lines[i].trim());
+        i++;
+      }
+      const dataRows = tableLines
+        .filter(l => !isSeparatorRow(l))
+        .map(l => l.split('|').slice(1, -1).map(c => c.trim()));
+      if (dataRows.length > 0) {
+        elements.push(
+          <table key={`t${i}`} style={{ width: '100%', borderCollapse: 'collapse', marginBottom: 10, fontSize: 11 }}>
+            <thead>
+              <tr>
+                {dataRows[0].map((h, ci) => (
+                  <th key={ci} style={{ padding: '4px 8px', borderBottom: '1px solid #555', textAlign: 'left', color: '#aaa', fontWeight: 600 }}>{parseInline(h)}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {dataRows.slice(1).map((row, ri) => (
+                <tr key={ri} style={{ borderBottom: '1px solid #2a2a2a' }}>
+                  {row.map((cell, ci) => (
+                    <td key={ci} style={{ padding: '3px 8px' }}>{parseInline(cell)}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        );
+      }
+      continue;
+    }
+
+    // Bullet list
+    if (trimmed.startsWith('- ')) {
+      const items = [];
+      while (i < lines.length && lines[i].trim().startsWith('- ')) {
+        items.push(lines[i].trim().slice(2));
+        i++;
+      }
+      elements.push(
+        <ul key={`ul${i}`} style={{ paddingLeft: 18, margin: '2px 0 8px' }}>
+          {items.map((item, li) => (
+            <li key={li} style={{ marginBottom: 3, fontSize: 11, lineHeight: 1.5 }}>{parseInline(item)}</li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    // Regular paragraph line
+    elements.push(<p key={i} style={{ margin: '0 0 7px', fontSize: 11, lineHeight: 1.6 }}>{parseInline(trimmed)}</p>);
+    i++;
+  }
+
+  return elements;
+}
+
+/**
+ * Help content dialog — renders a markdown help guide in a scrollable modal.
+ * @param {string} props.title - Dialog title bar text
+ * @param {'starting'|'units'} props.guide - Which guide to show
+ * @param {Function} props.onClose - Close handler
+ */
+export function HelpDialog({ title, guide, onClose }) {
+  const content = guide === 'starting' ? startingConditionsText : unitGuideText;
+  const btnStyle = {
+    padding: '6px 16px',
+    backgroundColor: COLORS.border,
+    border: 'none',
+    color: COLORS.text,
+    fontSize: 11,
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    fontWeight: 600,
+  };
+
+  return (
+    <div
+      style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 2000 }}
+      onClick={onClose}
+    >
+      <div
+        style={{ backgroundColor: COLORS.panel, border: `2px solid ${COLORS.border}`, width: 720, maxHeight: '85vh', display: 'flex', flexDirection: 'column', boxShadow: '0 4px 24px rgba(0,0,0,0.7)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div style={{ backgroundColor: COLORS.border, padding: '8px 12px', fontSize: 12, fontWeight: 600, letterSpacing: 1, textTransform: 'uppercase', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <span>{title}</span>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: COLORS.textMuted, fontSize: 16, cursor: 'pointer', lineHeight: 1 }}>&#x2715;</button>
+        </div>
+        <div style={{ padding: '16px 20px', overflowY: 'auto', color: COLORS.text, fontFamily: 'Monaco, monospace', flex: 1 }}>
+          {parseMarkdown(content)}
+        </div>
+        <div style={{ padding: '8px 12px', borderTop: `1px solid ${COLORS.border}`, display: 'flex', justifyContent: 'flex-end' }}>
+          <button onClick={onClose} style={btnStyle}>Close</button>
         </div>
       </div>
     </div>

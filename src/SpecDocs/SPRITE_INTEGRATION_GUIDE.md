@@ -2,16 +2,18 @@
 
 ## Overview
 
-This guide explains how to integrate the new image-based sprites with:
-- **64×48 pixel tiles** (4:3 aspect ratio)
-- **Dynamic checkerboard shading** (CSS filter, not pre-baked)
-- **Dynamic fog of war** (CSS overlay)
-- **Autotile architecture** for future water/land transitions
+The game supports two rendering modes:
+- **Image sprites**: PNG files loaded from `/sprites/`
+- **Emoji/letter fallback**: Used when `USE_IMAGE_SPRITES = false` or images fail to load
 
-## Files Provided
+Rendering is controlled by `sprite-config.js`. Tiles use 64x48 pixels (4:3 aspect ratio).
+
+---
+
+## File Structure
 
 ```
-sprites/                    # Copy to public/sprites/
+public/sprites/             # Copy PNG files here
 ├── tank_player.png        # Unit sprites (64x48)
 ├── tank_ai.png
 ├── fighter_player.png
@@ -28,202 +30,156 @@ sprites/                    # Copy to public/sprites/
 ├── carrier_ai.png
 ├── battleship_player.png
 ├── battleship_ai.png
-├── water.png              # Base terrain tiles
+├── water.png              # Terrain tiles
 ├── land.png
 ├── player_city.png
 ├── ai_city.png
 └── neutral_city.png
 
-game-constants.js          # Updated with TILE_WIDTH=64, TILE_HEIGHT=48
-sprite-config.js           # NEW - sprite/autotile configuration
-ui-components.jsx          # Updated with image sprite support
+src/
+├── sprite-config.js       # Configuration and export
+├── ui-components.jsx      # Imports sprite config
+└── game-constants.js      # TILE_WIDTH=64, TILE_HEIGHT=48
 ```
+
+---
 
 ## Quick Setup
 
-### 1. Copy Sprites
+### 1. Copy sprites
 ```bash
 cp -r sprites/ your-project/public/sprites/
 ```
 
-### 2. Replace/Add Source Files
-```bash
-cp game-constants.js your-project/src/
-cp sprite-config.js your-project/src/      # NEW FILE
-cp ui-components.jsx your-project/src/
+### 2. Enable image sprites
+In `src/sprite-config.js`:
+```javascript
+export const USE_IMAGE_SPRITES = true;
 ```
 
-### 3. Update Main Game File
+### 3. Verify
+Open browser dev tools Network tab. Sprites load from `/sprites/[unit]_[owner].png`.
 
-The main game file (`strategic-conquest-game-integrated.jsx`) needs updates:
+---
 
-#### 3a. Update Imports (around line 10)
+## Architecture
 
-```javascript
-// Change from:
-import {
-  TILE_SIZE, VIEWPORT_TILES_X, VIEWPORT_TILES_Y, ...
-} from './game-constants.js';
+### Dynamic Checkerboard Shading
 
-// To:
-import {
-  TILE_SIZE, TILE_WIDTH, TILE_HEIGHT, VIEWPORT_TILES_X, VIEWPORT_TILES_Y, ...
-} from './game-constants.js';
-```
-
-#### 3b. Find & Replace TILE_SIZE
-
-Replace all instances of `TILE_SIZE` with the appropriate dimension:
-- **X/horizontal positions**: Use `TILE_WIDTH`
-- **Y/vertical positions**: Use `TILE_HEIGHT`
-
-Key locations:
+No pre-baked dark/light tile variants. A single base tile is used with CSS:
 
 ```javascript
-// Viewport container size (~line 1540)
-// From:
-width: VIEWPORT_TILES_X * TILE_SIZE, height: VIEWPORT_TILES_Y * TILE_SIZE
-
-// To:
-width: VIEWPORT_TILES_X * TILE_WIDTH, height: VIEWPORT_TILES_Y * TILE_HEIGHT
-
-
-// Tile positioning (~line 1560)
-// From:
-left: vx * TILE_SIZE, top: vy * TILE_SIZE
-
-// To:
-left: vx * TILE_WIDTH, top: vy * TILE_HEIGHT
-
-
-// Unit positioning (~line 1565)
-// From:
-left: (u.x - viewportX) * TILE_SIZE, top: (u.y - viewportY) * TILE_SIZE
-
-// To:
-left: (u.x - viewportX) * TILE_WIDTH, top: (u.y - viewportY) * TILE_HEIGHT
-
-
-// AI observation trails (~lines 1571-1598)
-// Update all coordinate calculations similarly
-```
-
-## Architecture Notes
-
-### Dynamic Shading (Not Pre-baked)
-
-Previously: Tiles had `_dark.png` and `_light.png` variants for checkerboard.
-
-Now: Single base tile + CSS `filter: brightness(1.15)` for light squares.
-
-This reduces sprite count and simplifies future autotile transitions.
-
-```javascript
-// The Tile component now applies:
-const checkerFilter = (type === WATER || type === LAND) && isLight 
-  ? 'brightness(1.15)' 
+// In Tile component (ui-components.jsx)
+const checkerFilter = (type === WATER || type === LAND) && (x + y) % 2 === 1
+  ? 'brightness(1.15)'
   : 'none';
-
-// And uses imageRendering: 'pixelated' for crisp pixel art
 ```
 
 ### Dynamic Fog of War
 
-Fog is rendered as CSS overlay divs, not baked into tiles:
+Fog is a CSS overlay div, not baked into tiles:
 
 ```javascript
-// Unexplored
-{ backgroundColor: '#0a1015', opacity: 1 }
+// Unexplored:
+{ backgroundColor: COLORS.fogUnexplored, opacity: 1 }   // '#0a1015'
 
-// Explored but not visible  
-{ backgroundColor: 'rgba(10, 16, 21, 0.6)', opacity: 1 }
+// Explored but not visible:
+{ backgroundColor: COLORS.fogExplored, opacity: 1 }      // 'rgba(10,16,21,0.6)'
 ```
 
-### Autotile System (Future)
+### Autotile System (Optional)
 
-The `sprite-config.js` includes infrastructure for water/land transition tiles:
+`sprite-config.js` includes infrastructure for water/land transition tiles. Currently disabled by default.
 
+Enable with:
 ```javascript
-// When transition tiles are designed, name them:
-water.png       // Open water (no adjacent land)
-water_N.png     // Beach on north edge (land to north)
-water_NE.png    // Beach on north and east edges
-water_NESW.png  // Beach on all edges (small pond)
-
-// For corner beaches (diagonal land only):
-water_ne.png    // Corner beach in NE
-
-// Combined:
-water_N_se.png  // North edge + SE corner
+export const USE_AUTOTILES = true;
 ```
 
-Enable with: `USE_AUTOTILES = true` in sprite-config.js
+When enabled, `getWaterTileSrc(x, y, map)` calculates which adjacent tiles are land and returns the appropriate autotile variant. Water tile naming convention:
 
-The system calculates edges automatically using `calculateWaterEdges(x, y, map)`.
+```
+water.png        Open water (no adjacent land)
+water_N.png      Beach on north edge
+water_NE.png     Beach on north and east edges
+water_ne.png     Corner beach in NE (diagonal land only)
+water_N_se.png   North edge + SE corner
+water_NESW.png   Beach on all four edges
+```
+
+If an autotile variant image fails to load (404), `markAutotileFailed()` is called and the tile falls back to the base `water.png`.
+
+---
 
 ## Sprite Specifications
 
 | Property | Value |
 |----------|-------|
-| Dimensions | 64×48 pixels |
+| Dimensions | 64x48 pixels |
 | Aspect Ratio | 4:3 |
-| Scaling | Nearest-neighbor (pixel-perfect) |
+| Rendering | `image-rendering: pixelated` (nearest-neighbor) |
 | Format | PNG with transparency |
 
-### Unit Sprites
-- Player: Light gray background (#f0f0f0), dark border (#333)
-- AI: Light red background (#ffb4b4), red border (#c00)
+### Suggested Color Coding
 
-### Terrain Tiles
-- Water: Dark blue-green (#1a3a4a)
-- Land: Forest green (#4a7c59)
-- Cities: Gold/Red/White with star markers
+| Type | Background | Border |
+|------|-----------|--------|
+| Player units | Light gray (#f0f0f0) | Dark (#333) |
+| AI units | Light red (#ffb4b4) | Red (#c00) |
+| Water | Dark blue-green (#1a3a4a) | — |
+| Land | Forest green (#4a7c59) | — |
+| Player city | Gold with star | — |
+| AI city | Red with star | — |
+| Neutral city | White with star | — |
 
-## Viewport Calculations
+---
 
-With 64×48 tiles and ~20×14 grid:
-- Viewport width: 20 × 64 = 1280px
-- Viewport height: 14 × 48 = 672px
-- Total: ~860,160 pixels (fits well in 1920×1080 with UI panels)
+## Viewport Dimensions
 
-## Fallback Mode
+With 64x48 tiles and 24x18 grid:
+- Viewport width: 24 x 64 = 1536px
+- Viewport height: 18 x 48 = 864px
 
-If images don't load:
+Coordinates in the main game use `TILE_WIDTH` (64) for horizontal and `TILE_HEIGHT` (48) for vertical. The legacy `TILE_SIZE` alias equals `TILE_WIDTH` and should not be used for new code.
+
+---
+
+## `sprite-config.js` Exports
 
 ```javascript
-// In sprite-config.js:
-export const USE_IMAGE_SPRITES = false;
+export const USE_IMAGE_SPRITES: boolean;
+export const USE_AUTOTILES: boolean;
+export const SPRITE_BASE_PATH: string;      // '/sprites'
+export const SPRITE_CONFIG: object;         // Per-unit type config
+export const TILE_CONFIG: object;           // Per-tile type config
+export function getUnitSpriteSrc(unitType, owner): string;
+export function getTileImageSrc(tileType): string;
+export function getTileColor(tileType, isLight): string;
+export function getWaterTileSrc(x, y, map): string;  // Autotile lookup
+export const failedAutotiles: Set<string>;  // Tracks failed image loads
+export function markAutotileFailed(src): void;
 ```
 
-This reverts to letter-based rendering.
+---
+
+## Fallback Behavior
+
+If `USE_IMAGE_SPRITES = false` or an image fails to load, the `UnitSprite` component falls back to letter-based rendering using `spec.icon` (e.g. "T" for tank, "F" for fighter).
+
+The `Tile` component falls back to color-based rendering using `COLORS` from `game-constants.js`.
+
+---
 
 ## Troubleshooting
 
-### Sprites look blurry
-Ensure CSS includes:
-```css
-image-rendering: pixelated;
-```
+**Sprites look blurry:**
+Ensure CSS includes `image-rendering: pixelated` on the image element.
 
-### Checkerboard not showing
-Verify the `filter: brightness(1.15)` is being applied for odd tiles.
+**404 errors:**
+Check that files are in `public/sprites/`, not `src/sprites/`. Vite serves `public/` as the root.
 
-### 404 errors for sprites
-Check browser dev tools Network tab. Sprites should load from `/sprites/`.
+**Aspect ratio seems wrong:**
+Confirm both `TILE_WIDTH` (64) and `TILE_HEIGHT` (48) are imported and used for x/y positioning respectively. Do not use the legacy `TILE_SIZE` for new positioning code.
 
-### Aspect ratio seems wrong
-Confirm both TILE_WIDTH and TILE_HEIGHT are imported and used correctly (not just TILE_SIZE).
-
-## Next Steps
-
-1. **Design transition tiles** - Create `water_N.png`, `water_NE.png`, etc.
-2. **Enable autotiles** - Set `USE_AUTOTILES = true` once tiles are ready
-3. **Test thoroughly** - Verify pixel-perfect rendering at various zoom levels
-
-## File Verification
-
-```bash
-ls -la public/sprites/
-# Should show 21 PNG files (16 unit + 5 terrain)
-# All should be ~1-3KB each
-```
+**Checkerboard not showing:**
+Verify the `filter: brightness(1.15)` CSS is being applied to odd tiles `((x+y) % 2 === 1)`.

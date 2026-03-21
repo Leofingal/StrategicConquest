@@ -6,7 +6,7 @@ This project has experienced UTF-8 encoding corruption where Unicode symbols lik
 
 ## The Solution
 
-All Unicode symbols used in this project should be defined using **Unicode escape sequences** in the centralized `ui-symbols.js` file.
+All Unicode symbols used in this project must be defined using **Unicode escape sequences** in the centralized `ui-symbols.js` file.
 
 ## How to Use
 
@@ -57,42 +57,41 @@ See `ui-symbols.js` for the complete list.
 
 ## DO NOT
 
-❌ **Never** use literal Unicode characters directly in source files:
+Never use literal Unicode characters directly in source files:
 ```jsx
 // BAD - will get corrupted
 <button>×</button>
 <span>→</span>
 ```
 
-❌ **Never** copy/paste special characters from external sources
+Never copy/paste special characters from external sources.
 
-❌ **Never** type special characters using keyboard shortcuts
+Never type special characters using keyboard shortcuts.
 
 ## DO
 
-✅ **Always** use the SYMBOLS constants:
+Always use the SYMBOLS constants:
 ```jsx
 // GOOD - safe from encoding issues
 <button>{SYMBOLS.CLOSE}</button>
 <span>{SYMBOLS.ARROW_RIGHT}</span>
 ```
 
-✅ **Always** import from ui-symbols.js for any special characters
+Always import from `ui-symbols.js` for any special characters.
 
-✅ If you need a new symbol, add it to ui-symbols.js with its Unicode escape
-
-## Adding New Symbols
-
-1. Find the Unicode code point (e.g., U+2192 for →)
-2. Add to `ui-symbols.js`:
+If you need a new symbol, add it to `ui-symbols.js` with its Unicode escape:
 ```javascript
-NEW_SYMBOL: '\u2192',  // → description
+NEW_SYMBOL: '\u2192',  // description
 ```
-3. Use via `SYMBOLS.NEW_SYMBOL`
+
+## Files Using SYMBOLS
+
+- `ui-components.jsx` — Star markers, unit displays
+- `dialog-components.jsx` — Combat VS, delete buttons, movement trails
+
+When adding a new file that uses symbols, import from `ui-symbols.js` rather than hardcoding characters.
 
 ## Environment Setup (Prevention)
-
-To minimize future encoding issues:
 
 ### VS Code Settings
 ```json
@@ -116,15 +115,9 @@ end_of_line = lf
 git config --global core.autocrlf input
 ```
 
-## Files Using SYMBOLS
-
-- `ui-components.jsx` - Star markers, unit displays
-- `dialog-components.jsx` - Combat VS, delete buttons, movement trails
-- Add your file here when using SYMBOLS
-
 ## Troubleshooting
 
 If you see garbled characters like `Ãƒâ€"`:
 1. Identify the intended character
-2. Replace with appropriate `SYMBOLS.XXX` constant
-3. If constant doesn't exist, add it to `ui-symbols.js`
+2. Replace with the appropriate `SYMBOLS.XXX` constant
+3. If the constant doesn't exist, add it to `ui-symbols.js` with its Unicode escape sequence

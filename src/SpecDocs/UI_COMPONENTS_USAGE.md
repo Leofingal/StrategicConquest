@@ -2,230 +2,256 @@
 
 ## Overview
 
-This document provides usage examples for the extracted UI components from Strategic Conquest. 
+This document covers the components exported from `ui-components.jsx` and `dialog-components.jsx`.
 
-**Files Created:**
-- `ui-components.jsx` (662 lines) - Pure presentation components
-- `dialog-components.jsx` (985 lines) - Modal dialog components
-
-## Line Count Notes
-
-Both files exceed initial targets but this is justified:
-1. **Extensive JSDoc documentation** - Essential for maintainability
-2. **External sprite/tile configuration** - Critical user requirement
-3. **Proper inline styling** - Matches original format
-4. **Helper functions** - Included locally to maintain module independence
-
-Per QUICK_REFERENCE.md: "Module line counts can exceed targets if functionality justifies it"
+**Files:**
+- `ui-components.jsx` (~845 lines) — Pure presentation components
+- `dialog-components.jsx` (~2500 lines) — Modal dialog components
 
 ---
 
-## Basic Imports
+## Imports
 
 ```javascript
-// Import UI components
-import { 
-  Tile, 
-  UnitSprite, 
-  MiniMap, 
-  TurnInfo, 
-  UnitInfoPanel, 
-  CommandMenu, 
-  GotoLineOverlay, 
+import {
+  Tile,
+  UnitSprite,
+  MiniMap,
+  TurnInfo,
+  UnitInfoPanel,
+  CommandMenu,
+  GotoLineOverlay,
   PatrolOverlay,
   DEFAULT_SPRITE_CONFIG,
   DEFAULT_TILE_CONFIG
 } from './ui-components.jsx';
 
-// Import dialog components
-import { 
-  CityProductionDialog, 
-  UnitViewDialog, 
-  CityListDialog, 
-  PatrolConfirmDialog, 
-  SurrenderDialog, 
-  VictoryDialog, 
-  DefeatDialog 
+import {
+  CityProductionDialog,
+  UnitViewDialog,
+  CityListDialog,
+  AllUnitsListDialog,
+  PatrolConfirmDialog,
+  SurrenderDialog,
+  VictoryDialog,
+  DefeatDialog,
+  AITurnSummaryDialog,
+  SaveGameDialog,
+  LoadGameDialog,
+  getSavedGames
 } from './dialog-components.jsx';
 
-// Import constants (both files need this)
-import { 
+import {
   WATER, LAND, PLAYER_CITY, AI_CITY, NEUTRAL_CITY,
   FOG_UNEXPLORED, FOG_EXPLORED, FOG_VISIBLE,
-  COLORS, TILE_SIZE
+  COLORS, TILE_WIDTH, TILE_HEIGHT
 } from './game-constants.js';
 ```
 
 ---
 
-## Component Usage Examples
+## Component Reference
 
-### 1. Tile Component
+### 1. Tile
 
-**Basic usage:**
+Renders a single 64x48 map tile with optional overlays.
+
 ```javascript
-<Tile 
-  type={WATER} 
-  fogState={FOG_VISIBLE} 
-  x={10} 
-  y={5} 
-  onClick={() => handleTileClick(10, 5)} 
-/>
-```
-
-**With overlays:**
-```javascript
-<Tile 
-  type={LAND} 
-  fogState={FOG_VISIBLE} 
-  x={10} 
-  y={5} 
+<Tile
+  type={WATER}
+  fogState={FOG_VISIBLE}
+  x={10}
+  y={5}
   isValidMove={true}
   isAttack={false}
   isPath={false}
-  onClick={() => handleMove(10, 5)} 
+  isPatrolWaypoint={false}
+  onClick={() => handleTileClick(10, 5)}
   onDoubleClick={() => handleDoubleClick(10, 5)}
+  onMouseEnter={() => handleHover(10, 5)}
+  style={{ position: 'absolute', left: vx * TILE_WIDTH, top: vy * TILE_HEIGHT }}
+  map={gameState.map}  // Optional: enables autotile water edges
 />
 ```
 
-**With custom tile images:**
-```javascript
-const CUSTOM_TILE_CONFIG = {
-  [WATER]: { type: 'image', src: '/assets/tiles/water.png' },
-  [LAND]: { type: 'image', src: '/assets/tiles/grass.png' },
-  [PLAYER_CITY]: { type: 'image', src: '/assets/tiles/city-blue.png' },
-  [AI_CITY]: { type: 'image', src: '/assets/tiles/city-red.png' },
-  [NEUTRAL_CITY]: { type: 'image', src: '/assets/tiles/city-gray.png' },
-};
+**Props:**
+- `type` — Tile type constant (WATER, LAND, PLAYER_CITY, AI_CITY, NEUTRAL_CITY)
+- `fogState` — FOG_UNEXPLORED, FOG_EXPLORED, or FOG_VISIBLE
+- `x`, `y` — Grid coordinates (used for checkerboard shading and autotile)
+- `isValidMove` — Highlights as valid move (also used for bombard targets)
+- `isAttack` — Highlights as attack target (red border instead of gold)
+- `isPath` — Shows GoTo path dot
+- `isPatrolWaypoint` — Shows patrol waypoint marker
+- `style` — Applied to the outer div (used for absolute positioning in the viewport)
+- `tileConfig` — Override tile rendering (default: `DEFAULT_TILE_CONFIG`)
+- `map` — Optional full map array, required for autotile water edge detection
 
-<Tile 
-  type={WATER} 
-  fogState={FOG_VISIBLE} 
-  x={10} 
-  y={5} 
-  tileConfig={CUSTOM_TILE_CONFIG}
-  onClick={() => handleTileClick(10, 5)} 
+Checkerboard shading is applied via CSS `filter: brightness(1.15)` for `(x + y) % 2 === 1` tiles.
+
+---
+
+### 2. UnitSprite
+
+Renders a unit with health, cargo count, and stack count indicators.
+
+```javascript
+<UnitSprite
+  unit={unit}
+  isActive={unit.id === activeUnitId}
+  blink={blink}
+  onClick={() => handleUnitClick(unit.id)}
+  cargoCount={getCargoCount(unit.id, gameState.units)}
+  stackCount={tileStack[`${unit.x},${unit.y}`]}
 />
 ```
 
-### 2. UnitSprite Component
+**Props:**
+- `unit` — Unit object
+- `isActive` — Whether this is the active unit (highlights with blink effect)
+- `blink` — Boolean toggle for the blink animation (from `setInterval`)
+- `cargoCount` — Number shown as blue badge (top-left). Pass units-aboard count for carriers/transports.
+- `stackCount` — Number shown as amber badge (top-right). Only shown when `stackCount > 1`. Should be passed only for the topmost unit on the tile (see render loop below).
+- `isAboard` — Smaller, semi-transparent rendering for units shown aboard a carrier
+- `spriteConfig` — Override sprite rendering (default: `DEFAULT_SPRITE_CONFIG`)
 
-**Basic usage:**
+**Badge placement:**
+- Bottom-right (red): current strength when damaged
+- Top-left (blue): cargo count (units aboard this transport/carrier)
+- Top-right (amber): stack count (total friendly units on this tile, shown only when > 1)
+
+**Stack count render pattern (from main game):**
+
 ```javascript
-<UnitSprite 
-  unit={unit} 
-  isActive={unit.id === activeUnitId} 
-  onClick={() => handleUnitClick(unit.id)} 
+// Per-tile stack counts
+const tileStack = {};
+const tileTop = {};
+for (const u of visibleUnits) {
+  const k = `${u.x},${u.y}`;
+  tileStack[k] = (tileStack[k] || 0) + 1;
+  tileTop[k] = u.id;  // Last in sort order = drawn on top
+}
+
+// Render: pass stackCount only to the top unit on each tile
+<UnitSprite
+  unit={u}
+  cargoCount={getCargoCount(u.id, gameState.units)}
+  stackCount={tileTop[`${u.x},${u.y}`] === u.id ? tileStack[`${u.x},${u.y}`] : 0}
 />
 ```
 
-**With cargo count:**
-```javascript
-const cargoCount = gameState.units.filter(u => u.aboardId === carrier.id).length;
+---
 
-<UnitSprite 
-  unit={carrier} 
-  isActive={true} 
-  cargoCount={cargoCount}
-  onClick={() => handleUnitClick(carrier.id)} 
-/>
-```
+### 3. TurnInfo
 
-**With custom sprites:**
-```javascript
-const CUSTOM_SPRITE_CONFIG = {
-  tank: { type: 'image', src: '/assets/sprites/tank.png', width: 32, height: 32 },
-  fighter: { type: 'image', src: '/assets/sprites/fighter.png', width: 32, height: 32 },
-  bomber: { type: 'image', src: '/assets/sprites/bomber.png', width: 32, height: 32 },
-  // ... etc for all unit types
-};
-
-<UnitSprite 
-  unit={unit} 
-  isActive={false}
-  spriteConfig={CUSTOM_SPRITE_CONFIG}
-  onClick={() => handleUnitClick(unit.id)} 
-/>
-```
-
-### 3. TurnInfo Panel
+Left sidebar panel with turn info and action buttons.
 
 ```javascript
-<TurnInfo 
+<TurnInfo
   turn={gameState.turn}
   phase={phase}
   unitsWaiting={unitsWaiting}
-  playerCities={playerCityCount}
-  aiCities={aiCityCount}
-  neutralCities={neutralCityCount}
+  playerCities={cityCounts.player}
+  aiCities={cityCounts.ai}
+  neutralCities={cityCounts.neutral}
   onEndTurn={handleEndTurn}
   onShowCityList={() => setShowCityList(true)}
+  onShowAllUnits={() => setShowAllUnits(true)}
+  onShowAiSummary={() => setShowAiSummary(true)}
+  onSaveGame={handleSaveGame}
+  hasAiObservations={aiObservations.length > 0 || aiCombatEvents.length > 0}
 />
 ```
 
+---
+
 ### 4. UnitInfoPanel
 
-```javascript
-const activeUnit = gameState.units.find(u => u.id === activeUnitId);
+Left sidebar panel showing the active unit's stats.
 
-<UnitInfoPanel 
+```javascript
+<UnitInfoPanel
   unit={activeUnit}
   units={gameState.units}
   gameState={gameState}
 />
 ```
 
+Shows unit type, owner, strength, fuel, status, and cargo contents if a carrier/transport.
+
+---
+
 ### 5. CommandMenu
 
+Left sidebar panel with command buttons.
+
 ```javascript
-<CommandMenu 
+<CommandMenu
   activeUnit={activeUnit}
-  onCommand={handleCommand}
-  disabled={!activeUnit || activeUnit.movesLeft === 0}
+  onCommand={cmd => {
+    const map = { wait: 'w', skip: 'k', next: 'n', sentry: 's', goto: 'g', patrol: 'p', unload: 'u', bombard: 'b' };
+    if (map[cmd]) window.dispatchEvent(new KeyboardEvent('keydown', { key: map[cmd] }));
+  }}
+  disabled={!activeUnit || !!autoMovingUnitId}
   patrolMode={patrolMode}
+  bombardMode={bombardMode}
 />
 ```
 
+The `bombard` command is only shown when the active unit has `canBombard: true` (battleships).
+
+---
+
 ### 6. MiniMap
 
+Clickable mini-map for navigation.
+
 ```javascript
-<MiniMap 
+<MiniMap
   map={gameState.map}
-  fog={fogArray}
+  fog={fog}
   units={gameState.units}
   width={gameState.width}
   height={gameState.height}
   viewportX={viewportX}
   viewportY={viewportY}
   onNavigate={(x, y) => {
-    setViewportX(Math.max(0, Math.min(x, gameState.width - VIEWPORT_TILES_X)));
-    setViewportY(Math.max(0, Math.min(y, gameState.height - VIEWPORT_TILES_Y)));
+    setViewportX(Math.max(0, Math.min(gameState.width - VIEWPORT_TILES_X, x)));
+    setViewportY(Math.max(0, Math.min(gameState.height - VIEWPORT_TILES_Y, y)));
   }}
+  exploredPercent={exploredPercent}
 />
 ```
 
+---
+
 ### 7. GotoLineOverlay
 
+SVG line overlay showing GoTo path preview.
+
 ```javascript
-{activeUnit && activeUnit.gotoPath && activeUnit.gotoPath.length > 0 && (
-  <GotoLineOverlay 
-    sx={activeUnit.x}
-    sy={activeUnit.y}
-    ex={activeUnit.gotoPath[activeUnit.gotoPath.length - 1].x}
-    ey={activeUnit.gotoPath[activeUnit.gotoPath.length - 1].y}
+{(gotoMode || dragging) && previewTarget && activeUnit && gotoPreview && (
+  <GotoLineOverlay
+    sx={getUnitLocation(activeUnit, gameState.units).x}
+    sy={getUnitLocation(activeUnit, gameState.units).y}
+    ex={previewTarget.x}
+    ey={previewTarget.y}
     vx={viewportX}
     vy={viewportY}
-    dist={activeUnit.gotoPath.length}
-    turns={Math.ceil(activeUnit.gotoPath.length / UNIT_SPECS[activeUnit.type].movement)}
+    dist={gotoPreview.dist}
+    turns={gotoPreview.turns}
   />
 )}
 ```
 
+---
+
 ### 8. PatrolOverlay
+
+SVG overlay showing patrol waypoints and connecting lines.
 
 ```javascript
 {patrolMode && patrolWaypoints.length > 0 && (
-  <PatrolOverlay 
+  <PatrolOverlay
     waypoints={patrolWaypoints}
     vx={viewportX}
     vy={viewportY}
@@ -235,413 +261,152 @@ const activeUnit = gameState.units.find(u => u.id === activeUnitId);
 
 ---
 
-## Dialog Component Usage
+## Dialog Reference
 
-### 1. CityProductionDialog
+### CityProductionDialog
 
 ```javascript
 {showCityDialog && (
-  <CityProductionDialog 
+  <CityProductionDialog
     city={gameState.cities[showCityDialog]}
     cityKey={showCityDialog}
     map={gameState.map}
     width={gameState.width}
     height={gameState.height}
     units={gameState.units}
+    fogArray={fog}
     onClose={() => setShowCityDialog(null)}
-    onSetProduction={(cityKey, unitType) => {
-      // Update city production
-      setGameState(prev => ({
-        ...prev,
-        cities: {
-          ...prev.cities,
-          [cityKey]: {
-            ...prev.cities[cityKey],
-            producing: unitType
-          }
-        }
-      }));
-    }}
-    onMakeActive={(unitId) => {
-      setActiveUnitId(unitId);
-      const unit = gameState.units.find(u => u.id === unitId);
-      if (unit) {
-        // Center viewport on unit
-        setViewportX(Math.max(0, unit.x - Math.floor(VIEWPORT_TILES_X / 2)));
-        setViewportY(Math.max(0, unit.y - Math.floor(VIEWPORT_TILES_Y / 2)));
-      }
-    }}
+    onSetProduction={(ck, unitType) => setGameState(setCityProduction(gameState, ck, unitType))}
+    onMakeActive={handleMakeActive}
   />
 )}
 ```
 
-### 2. UnitViewDialog
+### UnitViewDialog
+
+Shows all units stacked at a tile. Clicking a unit makes it active.
 
 ```javascript
 {showUnitView && (
-  <UnitViewDialog 
+  <UnitViewDialog
     x={showUnitView.x}
     y={showUnitView.y}
     map={gameState.map}
     width={gameState.width}
     height={gameState.height}
     units={gameState.units}
+    fogArray={fog}
     onClose={() => setShowUnitView(null)}
-    onMakeActive={(unitId) => {
-      setActiveUnitId(unitId);
-      setShowUnitView(null);
-    }}
+    onMakeActive={handleMakeActive}
   />
 )}
 ```
 
-### 3. CityListDialog
+### CityListDialog / AllUnitsListDialog
 
-```javascript
-{showCityList && (
-  <CityListDialog 
-    cities={gameState.cities}
-    units={gameState.units}
-    onClose={() => setShowCityList(false)}
-    onSelectCity={(x, y) => {
-      // Center viewport on city
-      setViewportX(Math.max(0, x - Math.floor(VIEWPORT_TILES_X / 2)));
-      setViewportY(Math.max(0, y - Math.floor(VIEWPORT_TILES_Y / 2)));
-      // Open city production dialog
-      const cityKey = `${x},${y}`;
-      if (gameState.cities[cityKey]) {
-        setShowCityDialog(cityKey);
-      }
-    }}
-  />
-)}
-```
+Navigation dialogs. CityListDialog shows all player cities; AllUnitsListDialog shows all player units.
 
-### 4. PatrolConfirmDialog
+### PatrolConfirmDialog
 
 ```javascript
 {showPatrolConfirm && (
-  <PatrolConfirmDialog 
+  <PatrolConfirmDialog
     waypoints={patrolWaypoints}
-    onConfirm={() => {
-      // Set patrol route on active unit
-      setGameState(prev => ({
-        ...prev,
-        units: prev.units.map(u => 
-          u.id === activeUnitId 
-            ? { ...u, patrolPath: patrolWaypoints, status: STATUS_PATROL } 
-            : u
-        )
-      }));
-      setShowPatrolConfirm(false);
-      setPatrolMode(false);
-      setPatrolWaypoints([]);
-    }}
-    onCancel={() => {
-      setShowPatrolConfirm(false);
-      setPatrolMode(false);
-      setPatrolWaypoints([]);
-    }}
+    segmentDistances={patrolDistances}  // Distances computed by calcPatrolDists()
+    onConfirm={handleConfirmPatrol}
+    onCancel={() => { setShowPatrolConfirm(false); setPatrolMode(false); setPatrolWaypoints([]); }}
   />
 )}
 ```
 
-### 5. SurrenderDialog
+### AITurnSummaryDialog
+
+Shows AI unit movements (red trails) and combat events from the previous AI turn.
 
 ```javascript
-{showSurrender && (
-  <SurrenderDialog 
-    message={showSurrender}
-    onYes={() => {
-      setPhase(PHASE_DEFEAT);
-      setShowSurrender(null);
-    }}
-    onNo={() => {
-      setShowSurrender(null);
-    }}
+{showAiSummary && (aiObservations.length > 0 || aiCombatEvents.length > 0) && (
+  <AITurnSummaryDialog
+    observations={aiObservations}
+    combatEvents={aiCombatEvents}
+    onContinue={() => setShowAiSummary(false)}
+    onCenterOn={(pos) => { setViewportX(...); setViewportY(...); }}
   />
 )}
 ```
 
-### 6. VictoryDialog
+### SaveGameDialog / LoadGameDialog
+
+```javascript
+{showSaveDialog && (
+  <SaveGameDialog
+    gameState={gameState}
+    exploredTiles={exploredTiles}
+    aiKnowledge={aiKnowledge}
+    onSave={handleSaveComplete}
+    onSaveAndQuit={handleSaveAndQuit}
+    onClose={() => setShowSaveDialog(false)}
+  />
+)}
+```
+
+`getSavedGames()` returns an array of save slots (null if empty).
+
+### VictoryDialog / DefeatDialog
 
 ```javascript
 {phase === PHASE_VICTORY && (
-  <VictoryDialog 
+  <VictoryDialog
     turn={gameState.turn}
     mapSize={gameState.mapSize}
     difficulty={gameState.difficulty}
-    onNewGame={() => {
-      // Reset to menu
-      setPhase(PHASE_MENU);
-      setGameState(null);
-    }}
+    onNewGame={() => { setPhase(PHASE_MENU); setGameState(null); }}
   />
 )}
-```
 
-### 7. DefeatDialog
-
-```javascript
 {phase === PHASE_DEFEAT && (
-  <DefeatDialog 
-    onNewGame={() => {
-      setPhase(PHASE_MENU);
-      setGameState(null);
-    }}
-  />
+  <DefeatDialog onNewGame={() => { setPhase(PHASE_MENU); setGameState(null); }} />
 )}
 ```
 
----
-
-## Full Integration Example
-
-Here's how the main game component would use these modules:
-
-```javascript
-import React, { useState, useEffect } from 'react';
-import { 
-  Tile, UnitSprite, MiniMap, TurnInfo, UnitInfoPanel, CommandMenu,
-  GotoLineOverlay, PatrolOverlay, DEFAULT_SPRITE_CONFIG, DEFAULT_TILE_CONFIG
-} from './ui-components.jsx';
-import { 
-  CityProductionDialog, UnitViewDialog, CityListDialog,
-  PatrolConfirmDialog, SurrenderDialog, VictoryDialog, DefeatDialog
-} from './dialog-components.jsx';
-import { COLORS, TILE_SIZE, VIEWPORT_TILES_X, VIEWPORT_TILES_Y } from './game-constants.js';
-
-function StrategicConquestGame() {
-  const [gameState, setGameState] = useState(null);
-  const [phase, setPhase] = useState('menu');
-  const [viewportX, setViewportX] = useState(0);
-  const [viewportY, setViewportY] = useState(0);
-  const [activeUnitId, setActiveUnitId] = useState(null);
-  const [fogArray, setFogArray] = useState([]);
-  
-  // Dialog states
-  const [showCityDialog, setShowCityDialog] = useState(null);
-  const [showUnitView, setShowUnitView] = useState(null);
-  const [showCityList, setShowCityList] = useState(false);
-  const [showPatrolConfirm, setShowPatrolConfirm] = useState(false);
-  const [showSurrender, setShowSurrender] = useState(null);
-  
-  // Mode states
-  const [patrolMode, setPatrolMode] = useState(false);
-  const [patrolWaypoints, setPatrolWaypoints] = useState([]);
-  
-  if (phase === 'menu') {
-    return <MenuScreen onStartGame={(config) => {
-      // Initialize game...
-    }} />;
-  }
-  
-  const activeUnit = gameState?.units.find(u => u.id === activeUnitId);
-  
-  return (
-    <div style={{ display: 'flex', height: '100vh', backgroundColor: COLORS.background }}>
-      {/* Main viewport */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-        <div style={{ 
-          display: 'grid', 
-          gridTemplateColumns: `repeat(${VIEWPORT_TILES_X}, ${TILE_SIZE}px)`,
-          gap: 0 
-        }}>
-          {/* Render tiles */}
-          {gameState.map.slice(viewportY, viewportY + VIEWPORT_TILES_Y).map((row, dy) =>
-            row.slice(viewportX, viewportX + VIEWPORT_TILES_X).map((tile, dx) => {
-              const x = viewportX + dx;
-              const y = viewportY + dy;
-              return (
-                <Tile 
-                  key={`${x}-${y}`}
-                  type={tile}
-                  fogState={fogArray[y][x]}
-                  x={x}
-                  y={y}
-                  onClick={() => handleTileClick(x, y)}
-                />
-              );
-            })
-          )}
-        </div>
-        
-        {/* Render units */}
-        {gameState.units.map(unit => (
-          <UnitSprite 
-            key={unit.id}
-            unit={unit}
-            isActive={unit.id === activeUnitId}
-            onClick={() => handleUnitClick(unit.id)}
-          />
-        ))}
-        
-        {/* Overlays */}
-        {activeUnit?.gotoPath && (
-          <GotoLineOverlay 
-            sx={activeUnit.x}
-            sy={activeUnit.y}
-            ex={activeUnit.gotoPath[activeUnit.gotoPath.length - 1].x}
-            ey={activeUnit.gotoPath[activeUnit.gotoPath.length - 1].y}
-            vx={viewportX}
-            vy={viewportY}
-            dist={activeUnit.gotoPath.length}
-            turns={Math.ceil(activeUnit.gotoPath.length / UNIT_SPECS[activeUnit.type].movement)}
-          />
-        )}
-      </div>
-      
-      {/* Right sidebar */}
-      <div style={{ width: 200, display: 'flex', flexDirection: 'column', gap: 12, padding: 12 }}>
-        <TurnInfo 
-          turn={gameState.turn}
-          phase={phase}
-          unitsWaiting={unitsWaiting}
-          playerCities={playerCityCount}
-          aiCities={aiCityCount}
-          neutralCities={neutralCityCount}
-          onEndTurn={handleEndTurn}
-          onShowCityList={() => setShowCityList(true)}
-        />
-        
-        <UnitInfoPanel 
-          unit={activeUnit}
-          units={gameState.units}
-          gameState={gameState}
-        />
-        
-        <CommandMenu 
-          activeUnit={activeUnit}
-          onCommand={handleCommand}
-          disabled={!activeUnit}
-          patrolMode={patrolMode}
-        />
-        
-        <MiniMap 
-          map={gameState.map}
-          fog={fogArray}
-          units={gameState.units}
-          width={gameState.width}
-          height={gameState.height}
-          viewportX={viewportX}
-          viewportY={viewportY}
-          onNavigate={(x, y) => {
-            setViewportX(x);
-            setViewportY(y);
-          }}
-        />
-      </div>
-      
-      {/* Dialogs */}
-      {showCityDialog && <CityProductionDialog {...} />}
-      {showUnitView && <UnitViewDialog {...} />}
-      {showCityList && <CityListDialog {...} />}
-      {showPatrolConfirm && <PatrolConfirmDialog {...} />}
-      {showSurrender && <SurrenderDialog {...} />}
-      {phase === 'victory' && <VictoryDialog {...} />}
-      {phase === 'defeat' && <DefeatDialog {...} />}
-    </div>
-  );
-}
-```
+VictoryDialog saves the score to `localStorage` leaderboard.
 
 ---
 
 ## Swapping Art Assets
 
-To replace emojis with custom images:
+To use custom images instead of the default emoji/letter sprites:
 
-### Step 1: Create sprite configuration
+### Step 1: Provide image sprites
+Place PNG files in `public/sprites/` following the naming convention:
+- Unit sprites: `[unittype]_player.png`, `[unittype]_ai.png` (64x48px)
+- Terrain tiles: `water.png`, `land.png`, `player_city.png`, `ai_city.png`, `neutral_city.png`
+
+### Step 2: Enable image sprites
+In `sprite-config.js`:
 ```javascript
-const CUSTOM_SPRITES = {
-  tank: { type: 'image', src: '/assets/sprites/tank.png', width: 32, height: 32 },
-  fighter: { type: 'image', src: '/assets/sprites/fighter.png', width: 32, height: 32 },
-  bomber: { type: 'image', src: '/assets/sprites/bomber.png', width: 32, height: 32 },
-  transport: { type: 'image', src: '/assets/sprites/transport.png', width: 32, height: 32 },
-  destroyer: { type: 'image', src: '/assets/sprites/destroyer.png', width: 32, height: 32 },
-  submarine: { type: 'image', src: '/assets/sprites/submarine.png', width: 32, height: 32 },
-  carrier: { type: 'image', src: '/assets/sprites/carrier.png', width: 32, height: 32 },
-  battleship: { type: 'image', src: '/assets/sprites/battleship.png', width: 32, height: 32 },
-};
+export const USE_IMAGE_SPRITES = true;
 ```
 
-### Step 2: Pass to components
+### Step 3: (Optional) Enable autotile water edges
 ```javascript
-<UnitSprite 
-  unit={unit} 
-  isActive={false}
-  spriteConfig={CUSTOM_SPRITES}
-/>
+export const USE_AUTOTILES = true;
+// Then provide water_N.png, water_NE.png, etc. transition tiles
 ```
-
-### Step 3: Similarly for tiles
-```javascript
-const CUSTOM_TILES = {
-  [WATER]: { type: 'image', src: '/assets/tiles/water.png' },
-  [LAND]: { type: 'image', src: '/assets/tiles/land.png' },
-  [PLAYER_CITY]: { type: 'image', src: '/assets/tiles/city-player.png' },
-  [AI_CITY]: { type: 'image', src: '/assets/tiles/city-ai.png' },
-  [NEUTRAL_CITY]: { type: 'image', src: '/assets/tiles/city-neutral.png' },
-};
-
-<Tile 
-  type={tile}
-  fogState={fog}
-  x={x}
-  y={y}
-  tileConfig={CUSTOM_TILES}
-/>
-```
-
----
-
-## Testing Notes
-
-### Components Tested
-âœ… **Tile** - Renders correctly with colors and fog states  
-âœ… **UnitSprite** - Displays emoji sprites with health/cargo indicators  
-âœ… **TurnInfo** - Buttons and counters work  
-âœ… **UnitInfoPanel** - Shows unit stats correctly  
-âœ… **CommandMenu** - All commands render, disabled states work  
-âœ… **MiniMap** - Clickable navigation works  
-âœ… **GotoLineOverlay** - SVG line renders  
-âœ… **PatrolOverlay** - Waypoints and lines render  
-
-âœ… **CityProductionDialog** - Radio selection, unit list, coastal check  
-âœ… **UnitViewDialog** - Unit list with activate button  
-âœ… **CityListDialog** - Scrollable city list  
-âœ… **PatrolConfirmDialog** - Simple confirm/cancel  
-âœ… **SurrenderDialog** - Yes/No buttons  
-âœ… **VictoryDialog** - Leaderboard saves to localStorage  
-âœ… **DefeatDialog** - Simple game over screen  
-
-### Integration Testing Required
-- [ ] Full game loop with extracted components
-- [ ] External sprite/tile images loading
-- [ ] Dialog state management in main game
-- [ ] Performance with large maps (96x64+)
-- [ ] Memory usage with many units
-
-### Known Issues
-None - all components are pure presentation with no game logic.
-
-### Suggested Improvements
-1. Add React.memo() to expensive components (MiniMap, Tile)
-2. Consider virtual scrolling for large city/unit lists
-3. Add loading states for external images
-4. Add error boundaries around dialogs
 
 ---
 
 ## Dependencies
 
-**ui-components.jsx:**
+**`ui-components.jsx`:**
 - React
-- `./game-constants.js` - All constants
+- `./game-constants.js`
+- `./sprite-config.js`
+- `./ui-symbols.js`
 
-**dialog-components.jsx:**
-- React (useState, useEffect)
-- `./game-constants.js` - All constants
-- localStorage (for leaderboard)
+**`dialog-components.jsx`:**
+- React
+- `./game-constants.js`
+- `./ui-symbols.js`
+- `localStorage` (for leaderboard and save/load)
 
-**No circular dependencies** - Both files are independent modules that only import from game-constants.js.
+No circular dependencies. Both files are independent modules.

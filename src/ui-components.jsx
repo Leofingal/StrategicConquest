@@ -236,17 +236,19 @@ export function Tile({
  * @param {boolean} [props.blink] - Whether to invert colors (blinking effect)
  * @param {Function} [props.onClick] - Click handler
  * @param {number} [props.cargoCount] - Number of units aboard (for carriers/transports)
+ * @param {number} [props.stackCount] - Number of friendly units stacked on this tile (shown top-right)
  * @param {boolean} [props.isAboard] - Whether this unit is aboard another unit
  * @param {Object} [props.spriteConfig] - Sprite configuration object for custom rendering
  */
-export function UnitSprite({ 
-  unit, 
-  isActive, 
-  blink, 
-  onClick, 
-  cargoCount, 
+export function UnitSprite({
+  unit,
+  isActive,
+  blink,
+  onClick,
+  cargoCount,
+  stackCount,
   isAboard,
-  spriteConfig = DEFAULT_SPRITE_CONFIG 
+  spriteConfig = DEFAULT_SPRITE_CONFIG
 }) {
   const spec = UNIT_SPECS[unit.type];
   const sprite = spriteConfig[unit.type];
@@ -318,14 +320,14 @@ export function UnitSprite({
         </div>
       )}
       
-      {/* Cargo count (top-left) */}
+      {/* Cargo count (top-left, blue) */}
       {cargoCount > 0 && (
-        <div style={{ 
-          position: 'absolute', 
-          top: 0, 
-          left: 2, 
-          fontSize: 8, 
-          color: '#fff', 
+        <div style={{
+          position: 'absolute',
+          top: 0,
+          left: 2,
+          fontSize: 8,
+          color: '#fff',
           fontWeight: 'bold',
           textShadow: '0 0 2px #000',
           backgroundColor: 'rgba(0,0,128,0.7)',
@@ -333,6 +335,24 @@ export function UnitSprite({
           borderRadius: 2,
         }}>
           {cargoCount}
+        </div>
+      )}
+
+      {/* Stack count (top-right, amber) — only shown when >1 unit on tile */}
+      {stackCount > 1 && (
+        <div style={{
+          position: 'absolute',
+          top: 0,
+          right: 2,
+          fontSize: 8,
+          color: '#fff',
+          fontWeight: 'bold',
+          textShadow: '0 0 2px #000',
+          backgroundColor: 'rgba(180,100,0,0.85)',
+          padding: '0 2px',
+          borderRadius: 2,
+        }}>
+          {stackCount}
         </div>
       )}
     </div>

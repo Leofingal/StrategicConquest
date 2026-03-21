@@ -746,13 +746,15 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
 
   const defIdx = s.units.findIndex(x => x.id === target.id);
   if (defRem <= 0) {
-    s.units = s.units.filter(x => x.id !== target.id);
+    // Remove the destroyed unit and any cargo it was carrying
+    s.units = s.units.filter(x => x.id !== target.id && x.aboardId !== target.id);
   } else {
     s.units[defIdx] = { ...target, strength: defRem };
   }
 
   if (attRem <= 0) {
-    s.units = s.units.filter(x => x.id !== unit.id);
+    // Remove the destroyed unit and any cargo it was carrying
+    s.units = s.units.filter(x => x.id !== unit.id && x.aboardId !== unit.id);
     return { state: s, attackerDestroyed: true, combatEvent };
   } else {
     const newIdx = s.units.findIndex(x => x.id === unit.id);
@@ -761,7 +763,13 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
       if (defRem <= 0) {
         const remaining = s.units.filter(eu => eu.x === next.x && eu.y === next.y && eu.owner !== 'ai' && !eu.aboardId);
         if (remaining.length === 0) {
-          s.units[newIdx] = { ...s.units[newIdx], x: next.x, y: next.y };
+          // Naval units cannot advance onto land tiles (cities owned by AI are ok)
+          const targetTile = s.map[next.y]?.[next.x];
+          const canAdvance = !attSpec.isNaval || targetTile === WATER
+            || (s.cities[`${next.x},${next.y}`]?.owner === 'ai');
+          if (canAdvance) {
+            s.units[newIdx] = { ...s.units[newIdx], x: next.x, y: next.y };
+          }
         }
       }
     }
