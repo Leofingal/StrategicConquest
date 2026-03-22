@@ -1970,6 +1970,67 @@ export function deleteSaveSlot(slotIndex) {
 }
 
 /**
+ * Build serialized save data from current game state.
+ * Converts all Set objects to arrays for JSON storage.
+ */
+export function buildSaveData(gameState, exploredTiles, aiKnowledge, filename) {
+  const exploredArray = Array.from(exploredTiles);
+  const serializedAiKnowledge = aiKnowledge ? {
+    ...aiKnowledge,
+    exploredTiles: Array.from(aiKnowledge.exploredTiles || []),
+    homeIslandTiles: aiKnowledge.homeIslandTiles ? Array.from(aiKnowledge.homeIslandTiles) : null,
+    homeIslandCities: Array.from(aiKnowledge.homeIslandCities || []),
+    lostCities: Array.from(aiKnowledge.lostCities || []),
+    knownCities: Array.from(aiKnowledge.knownCities || []),
+    islands: (aiKnowledge.islands || []).map(island => ({
+      ...island,
+      tiles: Array.from(island.tiles || []),
+      cities: Array.from(island.cities || []),
+      coastTiles: Array.from(island.coastTiles || [])
+    }))
+  } : null;
+  return {
+    filename: filename || generateDefaultFilename(gameState.mapSize, gameState.difficulty, gameState.turn),
+    mapSize: gameState.mapSize,
+    terrain: gameState.terrain,
+    difficulty: gameState.difficulty,
+    turn: gameState.turn,
+    gameState,
+    exploredTiles: exploredArray,
+    aiKnowledge: serializedAiKnowledge,
+  };
+}
+
+/**
+ * Save to the dedicated autosave slot (separate from manual slots).
+ */
+export function saveAutoSave(saveData) {
+  try {
+    localStorage.setItem('scAutoSave', JSON.stringify({
+      ...saveData,
+      savedAt: new Date().toISOString(),
+      filename: 'Autosave',
+    }));
+    return true;
+  } catch (e) {
+    console.error('Error writing autosave:', e);
+    return false;
+  }
+}
+
+/**
+ * Retrieve the autosave slot, or null if none exists.
+ */
+export function getAutoSave() {
+  try {
+    const raw = localStorage.getItem('scAutoSave');
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
  * Save Game Dialog
  * Shows 5 save slots, allows naming and saving
  */
@@ -1999,38 +2060,10 @@ export function SaveGameDialog({
   
   const handleSave = (andQuit = false) => {
     setSaving(true);
-    
-    // Serialize exploredTiles Set to array
-    const exploredArray = Array.from(exploredTiles);
-    
-    // Serialize aiKnowledge Sets to arrays for JSON storage
-    const serializedAiKnowledge = aiKnowledge ? {
-      ...aiKnowledge,
-      exploredTiles: Array.from(aiKnowledge.exploredTiles || []),
-      homeIslandTiles: aiKnowledge.homeIslandTiles ? Array.from(aiKnowledge.homeIslandTiles) : null,
-      homeIslandCities: Array.from(aiKnowledge.homeIslandCities || []),
-      lostCities: Array.from(aiKnowledge.lostCities || []),
-      knownCities: Array.from(aiKnowledge.knownCities || []),
-      // Also serialize island-level Sets (tiles, cities, coastTiles)
-      islands: (aiKnowledge.islands || []).map(island => ({
-        ...island,
-        tiles: Array.from(island.tiles || []),
-        cities: Array.from(island.cities || []),
-        coastTiles: Array.from(island.coastTiles || [])
-      }))
-    } : null;
-    
-    const saveData = {
-      filename: filename.trim() || generateDefaultFilename(gameState.mapSize, gameState.difficulty, gameState.turn),
-      mapSize: gameState.mapSize,
-      terrain: gameState.terrain,
-      difficulty: gameState.difficulty,
-      turn: gameState.turn,
-      gameState: gameState,
-      exploredTiles: exploredArray,
-      aiKnowledge: serializedAiKnowledge
-    };
-    
+    const saveData = buildSaveData(
+      gameState, exploredTiles, aiKnowledge,
+      filename.trim() || generateDefaultFilename(gameState.mapSize, gameState.difficulty, gameState.turn)
+    );
     const success = saveGameToSlot(selectedSlot, saveData);
     
     if (success) {
@@ -2289,7 +2322,8 @@ export function SaveGameDialog({
  */
 export function LoadGameDialog({ onLoad, onClose }) {
   const [slots, setSlots] = useState(() => getSavedGames());
-  const [selectedSlot, setSelectedSlot] = useState(null);
+  const [autoSave, setAutoSave] = useState(() => getAutoSave());
+  const [selectedSlot, setSelectedSlot] = useState(null); // number 0-4 or 'auto'
   const [confirmDelete, setConfirmDelete] = useState(null);
   
   // Handle keyboard - Escape to close
@@ -2306,18 +2340,19 @@ export function LoadGameDialog({ onLoad, onClose }) {
   };
   
   const handleLoad = () => {
+    if (selectedSlot === 'auto' && autoSave) { onLoad(autoSave); return; }
     if (selectedSlot === null || !slots[selectedSlot]) return;
     onLoad(slots[selectedSlot]);
   };
-  
+
   const handleDelete = (idx) => {
     deleteSaveSlot(idx);
     setSlots(getSavedGames());
     setConfirmDelete(null);
     if (selectedSlot === idx) setSelectedSlot(null);
   };
-  
-  const hasSaves = slots.some(s => s !== null);
+
+  const hasSaves = slots.some(s => s !== null) || !!autoSave;
   
   return (
     <div 
@@ -2376,12 +2411,38 @@ export function LoadGameDialog({ onLoad, onClose }) {
                 Select a saved game to load
               </div>
               
+              {/* Autosave slot */}
+              {autoSave && (
+                <div
+                  style={{
+                    padding: '10px 12px',
+                    marginBottom: 6,
+                    backgroundColor: selectedSlot === 'auto' ? 'rgba(100, 180, 100, 0.2)' : COLORS.panelLight,
+                    border: `1px solid ${selectedSlot === 'auto' ? '#88c0a0' : COLORS.border}`,
+                    borderRadius: 4,
+                    cursor: 'pointer',
+                    transition: 'all 0.15s',
+                  }}
+                  onClick={() => setSelectedSlot('auto')}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 11, fontWeight: selectedSlot === 'auto' ? 600 : 400, color: selectedSlot === 'auto' ? '#88c0a0' : COLORS.text }}>
+                      Autosave — {autoSave.filename}
+                    </span>
+                    <span style={{ fontSize: 9, color: COLORS.textMuted }}>Turn {autoSave.turn}</span>
+                  </div>
+                  <div style={{ fontSize: 9, color: COLORS.textMuted, marginTop: 4 }}>
+                    {MAP_SIZES[autoSave.mapSize]?.label} | Diff {autoSave.difficulty} | {new Date(autoSave.savedAt).toLocaleDateString()} {new Date(autoSave.savedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </div>
+                </div>
+              )}
+
               {slots.map((slot, idx) => (
-                <div 
+                <div
                   key={idx}
-                  style={{ 
-                    padding: '10px 12px', 
-                    marginBottom: 6, 
+                  style={{
+                    padding: '10px 12px',
+                    marginBottom: 6,
                     backgroundColor: selectedSlot === idx ? 'rgba(200, 180, 100, 0.2)' : (slot ? COLORS.panelLight : 'transparent'),
                     border: `1px solid ${selectedSlot === idx ? COLORS.highlight : (slot ? COLORS.border : 'transparent')}`,
                     borderRadius: 4,
@@ -2492,13 +2553,13 @@ export function LoadGameDialog({ onLoad, onClose }) {
           </button>
           <button 
             onClick={handleLoad}
-            disabled={selectedSlot === null || !slots[selectedSlot]}
+            disabled={selectedSlot === null || (selectedSlot === 'auto' ? !autoSave : !slots[selectedSlot])}
             style={{ 
               padding: '8px 16px', 
-              backgroundColor: selectedSlot !== null && slots[selectedSlot] ? COLORS.highlight : COLORS.border, 
-              border: 'none', 
-              color: selectedSlot !== null && slots[selectedSlot] ? COLORS.textDark : COLORS.textMuted, 
-              cursor: selectedSlot !== null && slots[selectedSlot] ? 'pointer' : 'not-allowed',
+              backgroundColor: (selectedSlot === 'auto' ? !!autoSave : (selectedSlot !== null && slots[selectedSlot])) ? COLORS.highlight : COLORS.border,
+              border: 'none',
+              color: (selectedSlot === 'auto' ? !!autoSave : (selectedSlot !== null && slots[selectedSlot])) ? COLORS.textDark : COLORS.textMuted,
+              cursor: (selectedSlot === 'auto' ? !!autoSave : (selectedSlot !== null && slots[selectedSlot])) ? 'pointer' : 'not-allowed',
               fontWeight: 600,
               fontSize: 11,
               fontFamily: 'inherit'

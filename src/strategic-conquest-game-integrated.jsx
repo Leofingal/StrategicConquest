@@ -16,7 +16,7 @@ import { createGameState, setUnitGoTo, setUnitPatrol, setUnitStatus, unloadUnit,
 import { executeAITurn, createAIKnowledge, createAIKnowledgeFromState, recordPlayerObservations } from './ai-opponent.js';
 import { generateMap, MAP_SIZES, TERRAIN_TYPES, DIFFICULTY_LEVELS } from './map-generator.js';
 import { Tile, UnitSprite, MiniMap, TurnInfo, UnitInfoPanel, CommandMenu, GotoLineOverlay, PatrolOverlay } from './ui-components.jsx';
-import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, HelpDialog, getSavedGames } from './dialog-components.jsx';
+import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, HelpDialog, getSavedGames, getAutoSave, saveAutoSave, buildSaveData } from './dialog-components.jsx';
 
 // ============================================================================
 // LEADERBOARD
@@ -166,7 +166,7 @@ function MenuScreen({ onStart, onLoadGame }) {
   const [showLoadDialog, setShowLoadDialog] = useState(false);
   const [showHelp, setShowHelp] = useState(false);
   const scores = getTopScores(mapSize, difficulty);
-  const hasSaves = getSavedGames().some(s => s !== null);
+  const hasSaves = getSavedGames().some(s => s !== null) || !!getAutoSave();
   const selectStyle = { width: '100%', padding: '8px', backgroundColor: COLORS.panelLight, border: `1px solid ${COLORS.border}`, color: COLORS.text, fontSize: '12px' };
   const labelStyle = { display: 'block', fontSize: '10px', textTransform: 'uppercase', letterSpacing: '1px', color: COLORS.textMuted, marginBottom: '6px' };
   
@@ -1328,7 +1328,14 @@ export default function StrategicConquestGame() {
     }
     
     newState = { ...newState, turn: newState.turn + 1 };
-    
+
+    // Autosave after every turn
+    try {
+      saveAutoSave(buildSaveData(newState, exploredTiles, aiResult.knowledge));
+    } catch (e) {
+      console.warn('[AUTOSAVE] Failed:', e);
+    }
+
     // BUG #4 FIX: Queue units with GoTo/Patrol for auto-move at turn start
     const autoMoveUnits = newState.units.filter(u => 
       u.owner === 'player' && 
