@@ -11,7 +11,7 @@ import { UNIT_SPECS } from './game-constants.js';
 import { isAdjacentToWater } from './movement-engine.js';
 import { TARGET_DIST, PHASE, log } from './ai-helpers.js';
 
-const logProd = (...args) => console.log('[AI][PROD]', ...args);
+const logProd = () => {}; // silenced — summary printed by logTurnSummary
 
 // ============================================================================
 // MAIN PRODUCTION PLANNER

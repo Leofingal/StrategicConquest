@@ -16,9 +16,9 @@ import { calculateVisibility } from './fog-of-war.js';
 // ============================================================================
 
 // Master switches - set to false to silence categories
-const DEBUG = true;
+const DEBUG = false;
 const DEBUG_PHASE = true;
-const DEBUG_MISSIONS = true;
+const DEBUG_MISSIONS = false;
 
 export const log = (...args) => DEBUG && console.log('[AI]', ...args);
 export const logPhase = (...args) => DEBUG_PHASE && console.log('[AI][PHASE]', ...args);
@@ -26,54 +26,20 @@ export const logMission = (...args) => DEBUG_MISSIONS && console.log('[AI][MISSI
 
 // Consolidated turn summary logger
 export function logTurnSummary(state, knowledge, missions, turnLog) {
-  const totalTiles = state.width * state.height;
-  const explorePct = (knowledge.exploredTiles.size / totalTiles * 100).toFixed(1);
-  const cities = Object.values(state.cities);
-  const aiCities = cities.filter(c => c.owner === 'ai');
-  const knownNeutral = [];
-  const knownPlayer = [];
-  for (const [key, city] of Object.entries(state.cities)) {
-    if (!knowledge.exploredTiles.has(key)) continue;
-    if (city.owner === 'neutral') knownNeutral.push(city);
-    else if (city.owner === 'player') knownPlayer.push(city);
-  }
-
+  // Phase
   console.log(`[AI][PHASE] ${knowledge.explorationPhase}`);
-  console.log(`[AI][EXPLORE] ${explorePct}% explored (${knowledge.exploredTiles.size}/${totalTiles})`);
-  console.log(`[AI][EXPLORE] ${knownNeutral.length} neutral cities known, ${knownPlayer.length} player cities known`);
 
-  // Island summary - use homeIslandTiles for accurate home island stats
-  if (knowledge.homeIslandTiles) {
-    let homeExplored = 0;
-    for (const key of knowledge.homeIslandTiles) {
-      if (knowledge.exploredTiles.has(key)) homeExplored++;
-    }
-    const homePct = (homeExplored / knowledge.homeIslandTiles.size * 100).toFixed(0);
-    const homeCities = knowledge.homeIslandCities ? knowledge.homeIslandCities.size : '?';
-    const homeCaptured = knowledge.homeIslandCities
-      ? [...knowledge.homeIslandCities].filter(k => state.cities[k]?.owner === 'ai').length
-      : '?';
-    console.log(`[AI][EXPLORE] Home island: ${homeExplored}/${knowledge.homeIslandTiles.size} tiles explored (${homePct}%), cities: ${homeCaptured}/${homeCities} captured`);
-  }
-  if (knowledge.islands && knowledge.islands.length > 0) {
-    const others = knowledge.islands.filter(i => !i.isHomeIsland);
-    if (others.length > 0) {
-      for (const island of others) {
-        console.log(`[AI][EXPLORE] Island#${island.id}: ${island.tiles.size} tiles, ${island.cities.size} cities`);
-      }
-    }
-  }
-
-  // Production summary
-  for (const city of aiCities) {
-    const key = `${city.x},${city.y}`;
-    const coastal = isAdjacentToWater(city.x, city.y, state.map, state.map[0].length, state.map.length);
+  // Production summary (no coordinates)
+  const aiCities = Object.values(state.cities).filter(c => c.owner === 'ai');
+  const prodParts = aiCities.map(city => {
     const prod = city.producing || 'none';
     const spec = UNIT_SPECS[prod];
     const progress = city.progress?.[prod] || 0;
     const total = spec ? spec.productionDays : '?';
-    const tag = coastal ? ' [COASTAL]' : '';
-    console.log(`[AI][PROD] City (${city.x},${city.y}): ${prod} - ${progress}/${total} days${tag}`);
+    return `${prod}(${progress}/${total})`;
+  });
+  if (prodParts.length > 0) {
+    console.log(`[AI][PROD] ${prodParts.join(', ')}`);
   }
 
   // Unit counts
@@ -87,31 +53,6 @@ export function logTurnSummary(state, knowledge, missions, turnLog) {
     .map(([t, c]) => `${t}: ${c}`)
     .join(', ');
   console.log(`[AI][UNITS] ${countStr}`);
-
-  // Mission summary
-  if (missions && missions.size > 0) {
-    let missionCount = 0;
-    for (const [unitId, assignment] of missions) {
-      if (!assignment.mission) continue;
-      const unit = state.units.find(u => u.id === unitId);
-      if (!unit) continue;
-      const m = assignment.mission;
-      const pos = `@(${unit.x},${unit.y})`;
-      const targetStr = m.target ? `(${m.target.x},${m.target.y})` : '';
-      // Show cargo count for transports
-      let extra = '';
-      if (unit.type === 'transport') {
-        const cargo = state.units.filter(u => u.aboardId === unit.id);
-        extra = ` [cargo:${cargo.length}]`;
-      }
-      console.log(`[AI][MISSION] ${unit.type}#${unitId}${pos}: ${m.type}${targetStr} - ${m.reason || ''}${extra}`);
-      missionCount++;
-      if (missionCount >= 15) {
-        console.log(`[AI][MISSION] ... and ${missions.size - missionCount} more`);
-        break;
-      }
-    }
-  }
 }
 
 // ============================================================================
@@ -270,6 +211,7 @@ export function getMoveToward(unit, target, state, avoidTiles = null) {
   // must not be reused for non-avoided movement and vice versa.
   const cacheKey = `${unit.id}->${target.x},${target.y}${avoidTiles ? ':avoid' : ''}`;
   let path = _pathCache.get(cacheKey);
+  let hadCachedPath = !!path;
 
   if (!path) {
     const maxDist = Math.min(200, width + height);
@@ -279,6 +221,10 @@ export function getMoveToward(unit, target, state, avoidTiles = null) {
     path = findPath(unit.x, unit.y, target.x, target.y, unit, state, maxDist, tileCostFn);
     if (path && path.length > 0) {
       _pathCache.set(cacheKey, path);
+    } else {
+      // A* found no path — target is genuinely unreachable from here.
+      // Return null immediately; greedy would only cause aimless wandering.
+      return null;
     }
   }
 
@@ -298,9 +244,9 @@ export function getMoveToward(unit, target, state, avoidTiles = null) {
       if (isValidStep(nextStep.x, nextStep.y)) {
         return { x: nextStep.x, y: nextStep.y };
       } else {
-        // Path is blocked, invalidate cache and fall through to greedy
+        // Transient block (another unit in the way) — invalidate cache and try greedy
         _pathCache.delete(cacheKey);
-        log(`[PATH] Cached path blocked for ${unit.type}#${unit.id} at step ${stepIdx}, falling back`);
+        hadCachedPath = true; // signal: we had a valid path, just temporarily blocked
       }
     } else {
       // We've reached or passed all steps in the path
@@ -308,7 +254,7 @@ export function getMoveToward(unit, target, state, avoidTiles = null) {
     }
   }
 
-  // === STRATEGY 2: Greedy best adjacent tile (fallback) ===
+  // === STRATEGY 2: Greedy best adjacent tile (fallback for transient blocks) ===
   let bestMove = null, bestDist = Infinity;
   const validMoves = [];
 
@@ -334,10 +280,8 @@ export function getMoveToward(unit, target, state, avoidTiles = null) {
 
   // === STRATEGY 3: Any valid adjacent tile (prevents wasting all moves) ===
   if (validMoves.length > 0) {
-    // Pick a random valid move rather than losing all remaining movement
-    const pick = validMoves[Math.floor(Math.random() * validMoves.length)];
-    log(`[PATH] ${unit.type}#${unit.id} stuck, taking random valid move to (${pick.x},${pick.y})`);
-    return pick;
+    // Completely surrounded — pick any valid adjacent tile rather than wasting all remaining moves
+    return validMoves[Math.floor(Math.random() * validMoves.length)];
   }
 
   // Truly stuck (surrounded by impassable terrain or enemies on all sides)
@@ -394,7 +338,7 @@ export function findDeepScoutTarget(unit, state, knowledge, refuelPoints) {
         if (returnDist < bestReturnDist) bestReturnDist = returnDist;
       }
 
-      const totalFuelNeeded = distToTarget + bestReturnDist + 2; // +2 safety margin
+      const totalFuelNeeded = distToTarget + bestReturnDist + 4; // +4 safety margin
       if (totalFuelNeeded > unit.fuel) continue;
 
       // Score: prefer far away but also dense unexplored areas

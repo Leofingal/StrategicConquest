@@ -61,10 +61,9 @@ function simulateCombat(attacker, defSpec, defStr, allUnits = []) {
     const bonusDice = Math.floor(fightersAboard / 2);
     if (bonusDice > 0) {
       aRolls += bonusDice;
-      console.log(`[COMBAT] Carrier attack bonus: +${bonusDice} dice from ${fightersAboard} fighters`);
     }
   }
-  
+
   if (att.stealth && !defSpec.detectsSubs) dRolls = 0;
   const aHit = (att.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE, dHit = (defSpec.isLand && att.isNaval) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
   let dmgToDef = 0, dmgToAtt = 0;
@@ -96,19 +95,13 @@ function simulateCombatWithDefender(attacker, defender, allUnits = []) {
   if (att.carriesAir && allUnits.length > 0) {
     const fightersAboard = allUnits.filter(u => u.aboardId === attacker.id && u.type === 'fighter').length;
     const bonusDice = Math.floor(fightersAboard / 2);
-    if (bonusDice > 0) {
-      aRolls += bonusDice;
-      console.log(`[COMBAT] Carrier attack bonus: +${bonusDice} dice from ${fightersAboard} fighters`);
-    }
+    if (bonusDice > 0) aRolls += bonusDice;
   }
-  
+
   if (defSpec.carriesAir && allUnits.length > 0) {
     const fightersAboard = allUnits.filter(u => u.aboardId === defender.id && u.type === 'fighter').length;
     const bonusDice = Math.floor(fightersAboard / 2);
-    if (bonusDice > 0) {
-      dRolls += bonusDice;
-      console.log(`[COMBAT] Carrier defense bonus: +${bonusDice} dice from ${fightersAboard} fighters`);
-    }
+    if (bonusDice > 0) dRolls += bonusDice;
   }
   
   if (att.stealth && !defSpec.detectsSubs) dRolls = 0;
@@ -146,9 +139,6 @@ function resolveBombardment(attacker, defender) {
   }
   
   const defRem = Math.max(0, defender.strength - dmgToDef);
-  
-  console.log(`[BOMBARD] ${attacker.type} (str ${attacker.strength}) fires ${aRolls} rolls at ${defender.type} (str ${defender.strength})`);
-  console.log(`[BOMBARD] Hit chance: ${BOMBARD_HIT_CHANCE * 100}%, Damage dealt: ${dmgToDef}, Defender remaining: ${defRem}`);
   
   return {
     hits: dmgToDef,
@@ -312,9 +302,10 @@ export default function StrategicConquestGame() {
   
   // BUG #8 FIX: Use hoverTarget OR dragTarget for preview
   const previewTarget = hoverTarget || dragTarget;
-  const gotoPreview = useMemo(() => { 
-    if (!activeUnit || !previewTarget || !gameState) return null; 
-    const path = findPath(activeUnit.x, activeUnit.y, previewTarget.x, previewTarget.y, activeUnit, gameState); 
+  const gotoPreview = useMemo(() => {
+    if (!activeUnit || !previewTarget || !gameState) return null;
+    const gotoStart = activeUnit.aboardId ? getUnitLocation(activeUnit, gameState.units) : activeUnit;
+    const path = findPath(gotoStart.x, gotoStart.y, previewTarget.x, previewTarget.y, activeUnit, gameState);
     if (!path || path.length === 0) return null; 
     const spec = UNIT_SPECS[activeUnit.type]; 
     return { path, dist: path.length, turns: Math.ceil(path.length / spec.movement) }; 
@@ -351,7 +342,6 @@ export default function StrategicConquestGame() {
     const aiCity = Object.values(newState.cities).find(c => c.owner === 'ai');
     const aiStartX = aiCity ? aiCity.x : undefined;
     const aiStartY = aiCity ? aiCity.y : undefined;
-    console.log(`[StartGame] AI start position: (${aiStartX},${aiStartY})`);
     
     setGameState(newState); 
     setPhase(PHASE_PLAYING); 
@@ -453,9 +443,15 @@ export default function StrategicConquestGame() {
     const spec = UNIT_SPECS[unit.type];
     const newUnits = state.units.map(u => {
       if (u.id !== unitId) return u;
-      
+
       const updated = { ...u, x: targetX, y: targetY, movesLeft: u.movesLeft - 1 };
-      
+
+      // If launching from a carrier/transport, clear aboardId so subsequent steps
+      // use the unit's own position rather than the carrier's position
+      if (move.disembark && updated.aboardId) {
+        updated.aboardId = null;
+      }
+
       // Update goto path
       if (updated.gotoPath && updated.gotoPath.length > 0) {
         updated.gotoPath = updated.gotoPath.slice(1);
@@ -507,7 +503,6 @@ export default function StrategicConquestGame() {
         if (aIdx !== -1) {
           const aSpec = UNIT_SPECS[aircraft.type];
           newUnits[aIdx] = { ...newUnits[aIdx], fuel: aSpec.fuel };
-          console.log(`[CARRIER][AUTO] Aircraft ${aircraft.id} refueled by carrier arriving at (${targetX},${targetY})`);
         }
       }
     }
@@ -518,19 +513,17 @@ export default function StrategicConquestGame() {
       const cityKey = `${movedUnit.x},${movedUnit.y}`;
       const city = state.cities[cityKey];
       const isOnFriendlyCity = city && city.owner === unit.owner;
-      
+
       // BUG #4 FIX: Also check for carrier at crash location
-      const carrierAtCrashLoc = spec.isAir && newUnits.find(c => 
-        c.x === movedUnit.x && 
-        c.y === movedUnit.y && 
-        c.id !== movedUnit.id && 
-        c.owner === unit.owner && 
+      const carrierAtCrashLoc = spec.isAir && newUnits.find(c =>
+        c.x === movedUnit.x &&
+        c.y === movedUnit.y &&
+        c.id !== movedUnit.id &&
+        c.owner === unit.owner &&
         UNIT_SPECS[c.type].carriesAir
       );
-      
+
       if (!isOnFriendlyCity && !movedUnit.aboardId && !carrierAtCrashLoc) {
-        // Crash!
-        console.log(`[AUTO-MOVE] Unit ${unitId} crashed - out of fuel`);
         const survivingUnits = newUnits.filter(u => u.id !== unitId && u.aboardId !== unitId);
         return {
           newState: { ...state, units: survivingUnits },
@@ -632,7 +625,6 @@ export default function StrategicConquestGame() {
             u.x === ax && u.y === ay && u.owner === 'ai' && !u.aboardId
           );
           if (aiUnitNearby) {
-            console.log(`[AUTO-MOVE][OBSERVATION] Player ${movedUnit.type} at (${movedUnit.x},${movedUnit.y}) spotted by AI ${aiUnitNearby.type} at (${ax},${ay})`);
             observedByAI = true;
             setPlayerMadeContact(true);
             break;
@@ -642,7 +634,6 @@ export default function StrategicConquestGame() {
           const cityKey = `${ax},${ay}`;
           const cityNearby = result.newState.cities[cityKey];
           if (cityNearby && cityNearby.owner === 'ai') {
-            console.log(`[AUTO-MOVE][OBSERVATION] Player ${movedUnit.type} at (${movedUnit.x},${movedUnit.y}) spotted by AI city at (${ax},${ay})`);
             observedByAI = true;
             setPlayerMadeContact(true);
             break;
@@ -678,8 +669,7 @@ export default function StrategicConquestGame() {
         if (enemySighting) {
           const unit = result.newState.units.find(u => u.id === autoMovingUnitId);
           if (unit && (unit.status === STATUS_GOTO || unit.status === STATUS_PATROL)) {
-            console.log(`[AUTO-MOVE] Unit ${autoMovingUnitId} spotted enemy at (${enemySighting.x},${enemySighting.y}) - stopping`);
-            
+              
             // BUG #4 FIX: Only interrupt THIS unit, other units keep their objectives
             const interruptedUnits = result.newState.units.map(u => 
               u.id === autoMovingUnitId 
@@ -705,7 +695,6 @@ export default function StrategicConquestGame() {
         // Check if there are more units in the queue
         if (autoMoveQueue.length > 0) {
           const [nextId, ...rest] = autoMoveQueue;
-          console.log(`[AUTO-MOVE] Moving to next unit in queue: ${nextId}`);
           setAutoMoveQueue(rest);
           setAutoMovingUnitId(nextId);
           
@@ -761,7 +750,6 @@ export default function StrategicConquestGame() {
       return;
     }
     
-    console.log(`[BOMBARD] Battleship at (${activeUnit.x},${activeUnit.y}) bombarding (${targetX},${targetY})`);
     
     setGameState(prev => {
       let newUnits = [...prev.units];
@@ -869,7 +857,6 @@ export default function StrategicConquestGame() {
           
           if (spaceAvailable > 0 && tanksHere.length > 0) {
             const toLoad = tanksHere.slice(0, spaceAvailable);
-            console.log(`[AUTO-LOAD] Transport ${unit.id} loading ${toLoad.length} tanks on departure from city`);
             setMessage(`Transport loaded ${toLoad.length} tank(s) on departure.`);
             for (const tank of toLoad) {
               const tankIdx = newUnits.findIndex(u => u.id === tank.id);
@@ -908,15 +895,21 @@ export default function StrategicConquestGame() {
                 }];
               }
             });
-            console.log(`[OBSERVATION] AI observed player ${unit.type} attacking city at (${move.x},${move.y})`);
           }
           
           const result = resolveCityAttack(unit); 
           unit.strength = result.attRem;
           
-          if (result.cityDead) { 
+          if (result.cityDead) {
             newCities[ck] = { ...newCities[ck], owner: 'player', producing: 'tank' };
-            newMap[move.y][move.x] = PLAYER_CITY; 
+            newMap[move.y][move.x] = PLAYER_CITY;
+            // Refuel any friendly aircraft already on the captured city tile
+            newUnits = newUnits.map(u => {
+              if (u.x === move.x && u.y === move.y && u.owner === 'player' && !u.aboardId && UNIT_SPECS[u.type].isAir && UNIT_SPECS[u.type].fuel) {
+                return { ...u, fuel: UNIT_SPECS[u.type].fuel };
+              }
+              return u;
+            });
             // Tank becomes garrison - remove from active units
             newUnits = newUnits.filter(u => u.id !== unit.id);
             unitDestroyed = true; // BUG #10 FIX: Mark unit as removed (garrison)
@@ -948,7 +941,6 @@ export default function StrategicConquestGame() {
             // Pick strongest defender (by current strength)
             defenders.sort((a, b) => b.strength - a.strength);
             const defender = defenders[0];
-            console.log(`[COMBAT] Attacking ${defender.type} (strength ${defender.strength}) - strongest of ${defenders.length} potential defenders`);
             
             // PLAYER OBSERVATION FIX: Record combat observation for AI
             // When player attacks AI unit, AI "observes" the attacker
@@ -970,7 +962,6 @@ export default function StrategicConquestGame() {
                 }];
               }
             });
-            console.log(`[OBSERVATION] AI observed player ${unit.type} attacking at (${unit.x},${unit.y})`);
             
             const result = resolveCombat(unit, defender, newUnits); 
             unit.strength = result.attRem;
@@ -988,7 +979,6 @@ export default function StrategicConquestGame() {
               
               if (remainingEnemies.length > 0) {
                 shouldMove = false;
-                console.log(`[COMBAT] Defender destroyed but ${remainingEnemies.length} enemies remain - staying put`);
               } else {
                 const targetTile = prev.map[move.y][move.x];
                 if (spec.isNaval && targetTile !== WATER) {
@@ -997,7 +987,6 @@ export default function StrategicConquestGame() {
                   const isFriendlyCity = targetCity && targetCity.owner === unit.owner;
                   if (!isFriendlyCity) {
                     shouldMove = false;
-                    console.log(`[COMBAT] Naval unit destroyed land unit but can't enter land tile`);
                   }
                 }
               }
@@ -1032,10 +1021,8 @@ export default function StrategicConquestGame() {
         if (!hasAlreadyActed && unit.movesLeft > 1) {
           // First action of turn with 2+ moves - just deduct 1 move
           unit.movesLeft -= 1;
-          console.log(`[COMBAT] First attack, moves remaining: ${unit.movesLeft}`);
         } else {
           // Second attack OR first attack with only 1 move - consume all moves
-          console.log(`[COMBAT] ${hasAlreadyActed ? 'Second' : 'Final'} attack, consuming all moves`);
           unit.movesLeft = 0; 
           unit.status = STATUS_USED;
         }
@@ -1069,7 +1056,6 @@ export default function StrategicConquestGame() {
                   // Keep status as READY so player can still use it
                   status: STATUS_READY
                 };
-                console.log(`[CARRIER][BUG11] Fighter ${fighter.id} moved with carrier to (${move.x},${move.y})`);
               }
             }
 
@@ -1087,7 +1073,6 @@ export default function StrategicConquestGame() {
               if (aIdx !== -1) {
                 const aSpec = UNIT_SPECS[aircraft.type];
                 newUnits[aIdx] = { ...newUnits[aIdx], fuel: aSpec.fuel };
-                console.log(`[CARRIER] Aircraft ${aircraft.id} refueled by carrier arriving at (${move.x},${move.y})`);
               }
             }
           }
@@ -1100,7 +1085,6 @@ export default function StrategicConquestGame() {
           
           // BUG #2 FIX: Handle disembark - clear aboardId when leaving transport
           if (move.disembark && unit.aboardId) {
-            console.log(`[DISEMBARK][BUG2] Unit ${unit.id} disembarking from transport ${unit.aboardId}`);
             unit.aboardId = null;
             unit.status = STATUS_READY;
           }
@@ -1128,9 +1112,6 @@ export default function StrategicConquestGame() {
             
             if (isOnFriendlyCity || unit.aboardId || carrierAtLocation) {
               unit.fuel = spec.fuel;
-              if (carrierAtLocation) {
-                console.log(`[FUEL][BUG8] ${spec.name} refueled on carrier at (${unit.x},${unit.y})`);
-              }
             }
             if (unit.fuel <= 0 && !isOnFriendlyCity && !unit.aboardId && !carrierAtLocation) { 
               newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
@@ -1139,8 +1120,6 @@ export default function StrategicConquestGame() {
               return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
             }
           }
-        } else {
-          console.log(`[COMBAT] Unit staying at (${startX},${startY}) after attack`);
         }
         
         // BUG #10 FIX: Update unit in array by finding its current index (may have shifted)
@@ -1171,7 +1150,6 @@ export default function StrategicConquestGame() {
           
           if (spaceAvailable > 0 && aircraftHere.length > 0) {
             const toLoad = aircraftHere.slice(0, spaceAvailable);
-            console.log(`[AUTO-PICKUP][BUG8] Carrier ${unit.id} picking up ${toLoad.length} aircraft at (${unit.x},${unit.y})`);
             setMessage(`Carrier picked up ${toLoad.length} aircraft.`);
             for (const aircraft of toLoad) {
               const aircraftIdx = newUnits.findIndex(u => u.id === aircraft.id);
@@ -1198,7 +1176,6 @@ export default function StrategicConquestGame() {
           const ax = checkX + dir.dx, ay = checkY + dir.dy;
           const aiUnitNearby = newUnits.find(u => u.x === ax && u.y === ay && u.owner === 'ai' && !u.aboardId);
           if (aiUnitNearby) {
-            console.log(`[CONTACT] Player ${unit.type} at (${checkX},${checkY}) spotted by AI ${aiUnitNearby.type} at (${ax},${ay})`);
             madeContact = true;
             observedByAI = true;
             break;
@@ -1207,7 +1184,6 @@ export default function StrategicConquestGame() {
           const cityKey = `${ax},${ay}`;
           const cityNearby = newCities[cityKey];
           if (cityNearby && cityNearby.owner === 'ai') {
-            console.log(`[CONTACT] Player ${unit.type} at (${checkX},${checkY}) spotted by AI city at (${ax},${ay})`);
             madeContact = true;
             observedByAI = true;
             break;
@@ -1343,7 +1319,6 @@ export default function StrategicConquestGame() {
       !u.aboardId &&
       (u.status === STATUS_GOTO || u.status === STATUS_PATROL)
     );
-    console.log(`[TURN START] Found ${autoMoveUnits.length} units with auto-move orders`);
     
     if (autoMoveUnits.length > 0) {
       // Queue all auto-move units
@@ -1369,7 +1344,6 @@ export default function StrategicConquestGame() {
     if (!activeUnit || !gameState) return;
     if (activeUnit.status === STATUS_GOTO || activeUnit.status === STATUS_PATROL) {
       if (activeUnit.movesLeft > 0) {
-        console.log(`[RESUME] Resuming auto-move for unit ${activeUnit.id}`);
         setAutoMovingUnitId(activeUnit.id);
         setMessage('Resuming movement...');
       }
@@ -1547,8 +1521,10 @@ export default function StrategicConquestGame() {
       return;
     }
     
-    if (gotoMode && activeUnit) { 
-      const path = findPath(activeUnit.x, activeUnit.y, x, y, activeUnit, gameState); 
+    if (gotoMode && activeUnit) {
+      // If the unit is aboard a carrier, plan the path from the carrier's effective position
+      const gotoStart = activeUnit.aboardId ? getUnitLocation(activeUnit, gameState.units) : activeUnit;
+      const path = findPath(gotoStart.x, gotoStart.y, x, y, activeUnit, gameState);
       if (path?.length > 0) { 
         // BUG #4 FIX: Set goto and start auto-move
         const newState = setUnitGoTo(gameState, activeUnit.id, path);
@@ -1682,8 +1658,6 @@ export default function StrategicConquestGame() {
     
     // Reset UI state
     setMessage(`Game loaded: ${saveData.filename}. Turn ${saveData.turn}.`);
-    setAutoMovingUnitId(null);
-    setAutoMoveQueue([]);
     setBombardMode(false);
     setGotoMode(false);
     setPatrolMode(false);
@@ -1691,6 +1665,22 @@ export default function StrategicConquestGame() {
     setAiObservations([]);
     setAiCombatEvents([]);
     setShowAiSummary(false);
+
+    // Resume any units that had active goto/patrol orders
+    const autoMoveUnits = saveData.gameState.units.filter(u =>
+      u.owner === 'player' &&
+      u.movesLeft > 0 &&
+      !u.aboardId &&
+      (u.status === STATUS_GOTO || u.status === STATUS_PATROL)
+    );
+    if (autoMoveUnits.length > 0) {
+      const ids = autoMoveUnits.map(u => u.id);
+      setAutoMoveQueue(ids.slice(1));
+      setAutoMovingUnitId(ids[0]);
+    } else {
+      setAutoMovingUnitId(null);
+      setAutoMoveQueue([]);
+    }
   }, []);
   
   // RENDER

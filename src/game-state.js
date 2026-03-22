@@ -228,7 +228,6 @@ export function endPlayerTurn(state) {
     // BUG #8 FIX: Damaged naval units (half health or less) have reduced movement by 1
     if (spec.isNaval && unit.strength <= spec.strength / 2) {
       unit.movesLeft = Math.max(1, unit.movesLeft - 1);
-      console.log(`[MOVE][BUG8] Damaged naval ${spec.name} (${unit.strength}/${spec.strength}) has reduced movement: ${spec.movement} -> ${unit.movesLeft}`);
     }
     
     // Reset status
@@ -255,7 +254,6 @@ export function endPlayerTurn(state) {
         const carrierCity = newCities[carrierCityKey];
         if (carrierCity && carrierCity.owner === 'player') {
           shouldRepair = true;
-          console.log(`[REPAIR] Unit ${unit.id} aboard transport in friendly city - will repair`);
         }
       }
     } else {
@@ -269,7 +267,6 @@ export function endPlayerTurn(state) {
     
     if (shouldRepair && unit.strength < spec.strength) {
       unit.strength = Math.min(spec.strength, unit.strength + 1);
-      console.log(`[REPAIR] Unit ${unit.id} (${spec.name}) repaired: ${unit.strength - 1} -> ${unit.strength}`);
     }
     
     // Handle aircraft fuel
@@ -277,14 +274,12 @@ export function endPlayerTurn(state) {
       // BUG #7 FIX: Stationary aircraft consume 1 fuel per turn
       if (didNotMove) {
         unit.fuel = Math.max(0, unit.fuel - 1);
-        console.log(`[FUEL][BUG7] Stationary ${spec.name} at (${unit.x},${unit.y}) consumed fuel: ${unit.fuel + 1} -> ${unit.fuel}`);
       }
       
       // Refuel if on refuel tile or aboard carrier
       if (isOnRefuelTile(unit, { ...state, units: newUnits }) || unit.aboardId) {
         const oldFuel = unit.fuel;
         unit.fuel = spec.fuel;
-        console.log(`[FUEL][ENDTURN] ${spec.name} refueled at (${unit.x},${unit.y}): ${oldFuel} -> ${unit.fuel}`);
       }
     }
     
@@ -397,7 +392,6 @@ export function findNextUnit(state, currentId = null, excludeWaiting = false) {
     if (u.aboardId) {
       // Air units on carriers can still act
       if (isAirUnitOnCarrier(u, state.units)) {
-        console.log(`[QUEUE] Air unit ${u.id} (${u.type}) aboard carrier ${u.aboardId} - INCLUDED in movement queue`);
         return true;
       }
       // All other aboard units (tanks in transports) are excluded

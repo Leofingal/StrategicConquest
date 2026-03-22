@@ -304,7 +304,7 @@ function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCitie
     const distToRefuel = nearestRefuel ? manhattanDistance(fighter.x, fighter.y, nearestRefuel.x, nearestRefuel.y) : Infinity;
     const fuelAfterReturn = fighter.fuel - distToRefuel;
     // Max exploration radius from nearest refuel point (round trip)
-    const maxExploreRange = nearestRefuel ? Math.floor((fighter.fuel - 2) / 2) : 0;
+    const maxExploreRange = nearestRefuel ? Math.floor((fighter.fuel - 4) / 2) : 0;
     return { fighter, nearestRefuel, distToRefuel, fuelAfterReturn, maxExploreRange };
   });
 
@@ -315,7 +315,7 @@ function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCitie
     }
 
     // Priority 0: Return to refuel if fuel critical
-    if (fuelAfterReturn <= 2 && distToRefuel > 0) {
+    if (fuelAfterReturn <= 4 && distToRefuel > 0) {
       missions.set(fighter.id, {
         mission: {
           type: 'rebase',
@@ -395,12 +395,16 @@ function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCitie
 
     // Priority 3: Rebase to frontier city with unexplored in range
     if (frontierCities.length > 0) {
-      const otherFrontier = frontierCities.filter(c =>
+      // Only consider cities we can actually reach with remaining fuel
+      const reachableFrontier = frontierCities.filter(c =>
+        manhattanDistance(fighter.x, fighter.y, c.x, c.y) <= fighter.fuel - 2
+      );
+      const otherFrontier = reachableFrontier.filter(c =>
         c.x !== nearestRefuel.x || c.y !== nearestRefuel.y
       );
       const rebaseTarget = otherFrontier.length > 0
         ? findNearest(fighter, otherFrontier)
-        : findNearest(fighter, frontierCities);
+        : findNearest(fighter, reachableFrontier);
 
       if (rebaseTarget) {
         missions.set(fighter.id, {
@@ -417,18 +421,37 @@ function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCitie
       }
     }
 
-    // Default: nearest unexplored (fallback)
+    // Default: nearest unexplored (fallback) - only if round-trip safe
     const fallback = findNearestUnexplored(fighter, state, knowledge);
     if (fallback) {
-      missions.set(fighter.id, {
-        mission: {
-          type: 'explore_sector',
-          target: { x: fallback.x, y: fallback.y },
-          priority: 4,
-          assignedBy: 'exploration',
-          reason: 'nearest_unexplored_fallback'
-        }
-      });
+      const distToFallback = manhattanDistance(fighter.x, fighter.y, fallback.x, fallback.y);
+      let bestReturnDist = Infinity;
+      for (const rp of refuelPoints) {
+        const d = manhattanDistance(fallback.x, fallback.y, rp.x, rp.y);
+        if (d < bestReturnDist) bestReturnDist = d;
+      }
+      if (distToFallback + bestReturnDist + 4 <= fighter.fuel) {
+        missions.set(fighter.id, {
+          mission: {
+            type: 'explore_sector',
+            target: { x: fallback.x, y: fallback.y },
+            priority: 4,
+            assignedBy: 'exploration',
+            reason: 'nearest_unexplored_fallback'
+          }
+        });
+      } else {
+        // Fallback target isn't safely reachable — return to nearest refuel
+        missions.set(fighter.id, {
+          mission: {
+            type: 'rebase',
+            target: { x: nearestRefuel.x, y: nearestRefuel.y },
+            priority: 3,
+            assignedBy: 'exploration',
+            reason: 'return_no_safe_target'
+          }
+        });
+      }
     } else {
       missions.set(fighter.id, {
         mission: { type: 'wait', reason: 'nothing_to_explore' }
@@ -505,7 +528,7 @@ function findDeepScoutTargetInUnclaimedSector(fighter, state, knowledge, refuelP
           if (returnDist < bestReturnDist) bestReturnDist = returnDist;
         }
 
-        if (distToTarget + bestReturnDist + 2 > fighter.fuel) continue;
+        if (distToTarget + bestReturnDist + 4 > fighter.fuel) continue;
 
         // Density bonus
         let density = 0;

@@ -370,6 +370,13 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
         const cityKey = `${t.x},${t.y}`;
         s.cities = { ...s.cities, [cityKey]: { ...t.city, owner: 'ai', producing: 'tank', progress: {} } };
         s.map[t.y][t.x] = AI_CITY;
+        // Refuel any friendly aircraft on the newly captured city tile
+        s.units = s.units.map(u => {
+          if (u.x === t.x && u.y === t.y && u.owner === 'ai' && !u.aboardId && UNIT_SPECS[u.type].isAir && UNIT_SPECS[u.type].fuel) {
+            return { ...u, fuel: UNIT_SPECS[u.type].fuel };
+          }
+          return u;
+        });
         s.units = s.units.filter(u => u.id !== unit.id);
         continue;
       }
@@ -382,11 +389,10 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
         if (moveTarget) {
           s = executeMove(s, unitIdx, moveTarget, unit, turnLog, observationState);
         } else {
-          // Truly stuck (all adjacent tiles blocked) - lose 1 move, not all.
-          // Unit may become unstuck after other units move out of the way.
-          const newMoves = unit.movesLeft - 1;
-          log(`[STUCK] ${unit.type}#${unit.id} at (${unit.x},${unit.y}) blocked, ${newMoves} moves remain`);
-          s.units[unitIdx] = { ...unit, movesLeft: newMoves, status: newMoves <= 0 ? STATUS_USED : unit.status };
+          // No valid move (unreachable target or completely surrounded) — consume all moves
+          // so the unit does not waste further attempts this turn. Mission will be
+          // recalculated next turn; the exploration manager will pick a reachable target.
+          s.units[unitIdx] = { ...unit, movesLeft: 0, status: STATUS_USED };
         }
       }
     }
@@ -461,7 +467,7 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
     if (refuelPoints.length > 0) {
       const nearestRefuel = findNearest(unit, refuelPoints);
       const distToRefuel = nearestRefuel ? manhattanDistance(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y) : Infinity;
-      if (unit.fuel <= distToRefuel + 2) {
+      if (unit.fuel <= distToRefuel + 4) {
         return { action: 'move_toward', target: nearestRefuel, reason: 'fuel_critical' };
       }
     }
@@ -600,7 +606,7 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
       if (nearestRefuel) {
         const distToRefuel = manhattanDistance(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y);
         const fuelAfterReturn = unit.fuel - distToRefuel;
-        if (fuelAfterReturn <= 2) {
+        if (fuelAfterReturn <= 4) {
           // Must return to refuel instead of following mission
           return { action: 'move_toward', target: nearestRefuel, reason: 'fuel_return' };
         }
@@ -618,7 +624,7 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
     const nearestRefuel = findNearest(unit, refuelPoints);
     if (nearestRefuel) {
       const distToRefuel = manhattanDistance(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y);
-      if (unit.fuel - distToRefuel > 2) {
+      if (unit.fuel - distToRefuel > 4) {
         const target = findNearestUnexplored(unit, state, knowledge);
         if (target) return { action: 'move_toward', target, reason: 'explore_default' };
       }
@@ -1036,7 +1042,7 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
 
   // === ALLOCATE UNITS between managers ===
   const { explorationUnits, tacticalUnits } = allocateUnits(state, k.explorationPhase);
-  log(`Allocation: ${explorationUnits.length} exploration, ${tacticalUnits.length} tactical`);
+  console.log(`[AI][ALLOC] exploration: ${explorationUnits.length}, tactical: ${tacticalUnits.length}`);
 
   // === Detect threats ===
   const threats = detectThreats(state, k);
@@ -1080,8 +1086,6 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
   const newExplored = k.exploredTiles.size - turnStartExplored;
   const totalTiles = state.width * state.height;
   const explorePct = (k.exploredTiles.size / totalTiles * 100).toFixed(1);
-  log(`[EXPLORE] +${newExplored} tiles this turn -> ${explorePct}%`);
-
-  log(`======== AI TURN ${gameState.turn} END ========`);
+  console.log(`[AI][EXPLORE] +${newExplored} tiles this turn -> ${explorePct}% explored`);
   return { state, knowledge: k, log: turnLog, observations, combatEvents };
 }
