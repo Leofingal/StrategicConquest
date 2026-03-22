@@ -172,6 +172,13 @@ function determinePhase(k, state) {
       logPhase(`LAND -> TRANSITION: All ${k.homeIslandCities.size} home cities captured (homeExp=${(homeExp*100).toFixed(0)}%)`);
       return PHASE.TRANSITION;
     }
+    // TANK THRESHOLD: Once 6 active tanks exist, the land force is large enough
+    // to keep capturing home cities without full focus — start naval production now.
+    const activeTanks = state.units.filter(u => u.owner === 'ai' && u.type === 'tank' && !u.aboardId).length;
+    if (activeTanks >= 6) {
+      logPhase(`LAND -> TRANSITION: 6 active tanks (${activeTanks}) — starting naval ramp`);
+      return PHASE.TRANSITION;
+    }
     // SECONDARY: 90% explored + cities captured (original trigger)
     if (homeExp >= AI_CONFIG.exploration.homeComplete && homeCitiesCaptured) {
       logPhase(`LAND -> TRANSITION: Home ${(homeExp*100).toFixed(0)}% + cities captured`);
