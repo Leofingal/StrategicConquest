@@ -15,17 +15,26 @@ import { calculateVisibility } from './fog-of-war.js';
 // DEBUG LOGGING
 // ============================================================================
 
-// Master switches - set to false to silence categories
-const DEBUG = false;
-const DEBUG_PHASE = true;
-const DEBUG_MISSIONS = false;
+// Runtime-togglable debug flags — call setAILogging() to switch modes.
+// Observer mode ON  → debugAI=false, debugObserver=true
+// Observer mode OFF → debugAI=true,  debugObserver=false
+let _debugAI = false;
+let _debugObserver = false;
 
-export const log = (...args) => DEBUG && console.log('[AI]', ...args);
-export const logPhase = (...args) => DEBUG_PHASE && console.log('[AI][PHASE]', ...args);
-export const logMission = (...args) => DEBUG_MISSIONS && console.log('[AI][MISSION]', ...args);
+export function setAILogging(ai, observer) {
+  _debugAI = ai;
+  _debugObserver = observer;
+}
+
+export const log      = (...args) => _debugAI      && console.log('[AI]', ...args);
+export const logPhase = (...args) => _debugAI      && console.log('[AI][PHASE]', ...args);
+export const logMission = (...args) => _debugAI    && console.log('[AI][MISSION]', ...args);
+export const logAI    = (pfx, ...args) => _debugAI && console.log(`[AI][${pfx}]`, ...args);
+export const logObs   = (...args) => _debugObserver && console.log('[OBS]', ...args);
 
 // Consolidated turn summary logger
 export function logTurnSummary(state, knowledge, missions, turnLog) {
+  if (!_debugAI) return;
   // Phase
   console.log(`[AI][PHASE] ${knowledge.explorationPhase}`);
 
@@ -98,7 +107,7 @@ export const AI_CONFIG = {
 // Unit allocation by phase: fraction given to tactical manager
 export const TACTICAL_ALLOCATION = {
   [PHASE.LAND]: { fighter: 0, destroyer: 0, submarine: 0, battleship: 0, carrier: 0, bomber: 0 },
-  [PHASE.TRANSITION]: { fighter: 0, destroyer: 0, submarine: 0, battleship: 0, carrier: 0, bomber: 0 },
+  [PHASE.TRANSITION]: { fighter: 0, destroyer: 0, submarine: 0.6, battleship: 1.0, carrier: 0, bomber: 0 },
   [PHASE.NAVAL]: { fighter: 0.30, destroyer: 0.70, submarine: 1.0, battleship: 1.0, carrier: 0.70, bomber: 0.50 },
   [PHASE.LATE_GAME]: { fighter: 0.70, destroyer: 0.90, submarine: 1.0, battleship: 1.0, carrier: 0.90, bomber: 1.0 }
 };
@@ -240,11 +249,13 @@ export function getMoveToward(unit, target, state, avoidTiles = null) {
 
     if (stepIdx < path.length) {
       const nextStep = path[stepIdx];
-      // Validate the step is still clear (units may have moved since path was cached)
-      if (isValidStep(nextStep.x, nextStep.y)) {
+      // Validate (a) the unit is actually adjacent to this step (it may have deviated from
+      // the cached path, e.g. after a fuel-return detour) and (b) the tile is still clear.
+      const isAdjacent = Math.abs(nextStep.x - unit.x) <= 1 && Math.abs(nextStep.y - unit.y) <= 1;
+      if (isAdjacent && isValidStep(nextStep.x, nextStep.y)) {
         return { x: nextStep.x, y: nextStep.y };
       } else {
-        // Transient block (another unit in the way) — invalidate cache and try greedy
+        // Either unit deviated from path or tile is transiently blocked — invalidate cache
         _pathCache.delete(cacheKey);
         hadCachedPath = true; // signal: we had a valid path, just temporarily blocked
       }
@@ -513,6 +524,8 @@ export function getAdjacentEnemies(unit, state) {
     for (const enemy of enemiesAt) {
       const eSpec = UNIT_SPECS[enemy.type];
       if (spec.stealth && !eSpec.isNaval) continue;
+      // Stealthy enemy units (subs) are invisible unless the attacker has detectsSubs
+      if (eSpec.stealth && !spec.detectsSubs) continue;
       const tile = state.map[ny]?.[nx];
       if (spec.isLand && eSpec.isNaval && tile === WATER) continue;
       enemies.push({ enemy, x: nx, y: ny });

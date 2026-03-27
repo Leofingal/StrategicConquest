@@ -14,6 +14,8 @@ import { calculateVisibility, buildFogArray, updateExploredTiles } from './fog-o
 import { getValidMoves, findPath, getUnitLocation, getCargoCount, isOnRefuelTile, getBombardTargets } from './movement-engine.js';
 import { createGameState, setUnitGoTo, setUnitPatrol, setUnitStatus, unloadUnit, setCityProduction, endPlayerTurn, checkVictoryCondition, findNextUnit } from './game-state.js';
 import { executeAITurn, createAIKnowledge, createAIKnowledgeFromState, recordPlayerObservations } from './ai-opponent.js';
+import { setAILogging } from './ai-helpers.js';
+import { createObserverKnowledge, executeObserverTurn } from './ai-observer.js';
 import { generateMap, MAP_SIZES, TERRAIN_TYPES, DIFFICULTY_LEVELS } from './map-generator.js';
 import { Tile, UnitSprite, MiniMap, TurnInfo, UnitInfoPanel, CommandMenu, GotoLineOverlay, PatrolOverlay } from './ui-components.jsx';
 import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, HelpDialog, getSavedGames, getAutoSave, saveAutoSave, buildSaveData } from './dialog-components.jsx';
@@ -213,6 +215,7 @@ export default function StrategicConquestGame() {
   const [aiKnowledge, setAiKnowledge] = useState(() => createAIKnowledge());
   const [viewportX, setViewportX] = useState(0), [viewportY, setViewportY] = useState(0);
   const [message, setMessage] = useState('Your turn. Select a unit to move.');
+  const [messageLog, setMessageLog] = useState(['Your turn. Select a unit to move.']);
   const [blink, setBlink] = useState(false);
   const [gotoMode, setGotoMode] = useState(false), [patrolMode, setPatrolMode] = useState(false), [patrolWaypoints, setPatrolWaypoints] = useState([]), [patrolDistances, setPatrolDistances] = useState(null);
   const [bombardMode, setBombardMode] = useState(false); // NEW: Bombardment mode for battleships
@@ -245,6 +248,11 @@ export default function StrategicConquestGame() {
   // BUG #13: Surrender state
   const [showSurrender, setShowSurrender] = useState(null); // null or { type: 'offer'|'request', message: string }
   
+  // AI Observer Mode: AI drives player units so player can observe AI decisions
+  const [aiObserverMode, setAiObserverMode] = useState(false);
+  const [observerTrails, setObserverTrails] = useState([]);
+  const [observerKnowledge, setObserverKnowledge] = useState(null);
+
   // Save/Load game state
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   
@@ -313,6 +321,8 @@ export default function StrategicConquestGame() {
   
   useEffect(() => { if (phase !== PHASE_PLAYING) return; const i = setInterval(() => setBlink(b => !b), 400); return () => clearInterval(i); }, [phase]);
   useEffect(() => { if (gameState) setExploredTiles(prev => updateExploredTiles(prev, currentVisibility)); }, [currentVisibility, gameState]);
+  useEffect(() => { setMessageLog(prev => prev[prev.length - 1] === message ? prev : [...prev.slice(-3), message]); }, [message]);
+  useEffect(() => { setAILogging(!aiObserverMode, aiObserverMode); }, [aiObserverMode]);
   
   // BUG #6 FIX: Show city dialog when a city is captured
   // BUG #2 FIX: Only show dialog if city is actually player-owned (capture succeeded)
@@ -334,20 +344,44 @@ export default function StrategicConquestGame() {
     return state;
   }, [centerOnUnit]);
   
+  // Run the full AI engine against all player units and apply the result.
+  // Called when toggling observer mode ON mid-turn.
+  const activateObserverMoves = useCallback((currentGameState) => {
+    const seedKnowledge = observerKnowledge
+      ? { ...observerKnowledge, exploredTiles: new Set([...observerKnowledge.exploredTiles, ...exploredTiles]) }
+      : createObserverKnowledge(currentGameState, exploredTiles);
+    const result = executeObserverTurn(currentGameState, seedKnowledge);
+    setGameState(result.state);
+    setObserverKnowledge(result.observerKnowledge);
+    setExploredTiles(new Set(result.observerKnowledge.exploredTiles));
+    setObserverTrails(result.trails);
+    if (result.trails.length > 0) {
+      // Mark all trail tiles as visible this turn so they show bright (FOG_VISIBLE)
+      const trailVisible = new Set();
+      for (const obs of result.trails) {
+        for (const pos of obs.trail) {
+          for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+            trailVisible.add(`${pos.x + dx},${pos.y + dy}`);
+          }
+        }
+      }
+      setTurnVisibility(prev => new Set([...prev, ...trailVisible]));
+      setMessage('Observer mode: AI drove your units. Press End Turn when ready.');
+    } else {
+      setMessage('Observer mode ON: no moves to assign. Press End Turn.');
+    }
+  }, [exploredTiles, observerKnowledge]);
+
   const handleStartGame = useCallback((mapSize, terrain, difficulty) => {
     const mapData = generateMap(mapSize, terrain, difficulty);
     const newState = createGameState(mapData, mapSize, terrain, difficulty);
     
-    // BUG FIX: Initialize AI knowledge with proper start position from first AI city
-    const aiCity = Object.values(newState.cities).find(c => c.owner === 'ai');
-    const aiStartX = aiCity ? aiCity.x : undefined;
-    const aiStartY = aiCity ? aiCity.y : undefined;
-    
-    setGameState(newState); 
-    setPhase(PHASE_PLAYING); 
-    setExploredTiles(new Set()); 
-    setTurnVisibility(new Set()); 
-    setAiKnowledge(createAIKnowledge(aiStartX, aiStartY));
+    // Initialize AI knowledge from clean initial state so home island is correctly populated
+    setGameState(newState);
+    setPhase(PHASE_PLAYING);
+    setExploredTiles(new Set());
+    setTurnVisibility(new Set());
+    setAiKnowledge(createAIKnowledgeFromState(newState));
     
     const pCity = Object.values(newState.cities).find(c => c.owner === 'player');
     if (pCity) { setViewportX(Math.max(0, pCity.x - Math.floor(VIEWPORT_TILES_X / 2))); setViewportY(Math.max(0, pCity.y - Math.floor(VIEWPORT_TILES_Y / 2))); }
@@ -356,6 +390,8 @@ export default function StrategicConquestGame() {
     setAutoMoveQueue([]);
     setCapturedCityKey(null);
     setBombardMode(false); // Reset bombard mode on new game
+    setObserverKnowledge(null);
+    setObserverTrails([]);
   }, []);
   
   // ============================================================================
@@ -398,9 +434,9 @@ export default function StrategicConquestGame() {
     }
     
     // Check for enemy at target - STOP for player intervention
-    const enemiesAtTarget = state.units.filter(u => 
-      u.x === targetX && u.y === targetY && 
-      u.owner !== unit.owner && 
+    const enemiesAtTarget = state.units.filter(u =>
+      u.x === targetX && u.y === targetY &&
+      u.owner !== unit.owner &&
       !u.aboardId
     );
     const cityAtTarget = state.cities[`${targetX},${targetY}`];
@@ -411,11 +447,11 @@ export default function StrategicConquestGame() {
     if (enemiesAtTarget.length > 0 || isHostileCityAtTarget) {
       if (DEBUG_GOTO) console.log(`[AUTO-MOVE] Unit ${unitId} encountered ${isHostileCityAtTarget ? 'hostile city' : 'enemy'} at (${targetX},${targetY}) - stopping for player`);
       // Keep the path but stop - player can manually attack or press a key to resume
-      return { 
-        newState: state, 
-        stopped: true, 
-        message: `${isHostileCityAtTarget && !enemiesAtTarget.length ? 'Hostile city' : 'Enemy'} spotted at (${targetX},${targetY})! Unit awaiting orders.`, 
-        reason: 'enemy_spotted' 
+      return {
+        newState: state,
+        stopped: true,
+        message: `${isHostileCityAtTarget && !enemiesAtTarget.length ? 'Hostile city' : 'Enemy'} spotted at (${targetX},${targetY})! Unit awaiting orders.`,
+        reason: 'enemy_spotted'
       };
     }
     
@@ -662,7 +698,7 @@ export default function StrategicConquestGame() {
       }
       
       setGameState(result.newState);
-      
+
       // BUG #3 FIX: Check for visible enemies AFTER move (sight range 1 = adjacent)
       if (!result.stopped) {
         const enemySighting = checkForVisibleEnemies(result.newState, autoMovingUnitId);
@@ -691,24 +727,35 @@ export default function StrategicConquestGame() {
       
       if (result.stopped) {
         if (result.message) setMessage(result.message);
-        
+
+        // If the unit arrived at its goto destination with moves remaining, keep it
+        // as the active unit so the player can continue directing it immediately.
+        const arrivedUnit = result.reason === 'arrived'
+          ? result.newState.units.find(u => u.id === autoMovingUnitId)
+          : null;
+        if (arrivedUnit && arrivedUnit.movesLeft > 0) {
+          setAutoMovingUnitId(null);
+          setGameState({ ...result.newState, activeUnitId: arrivedUnit.id });
+          centerOnUnit(arrivedUnit);
+          if (!result.message) setMessage('Arrived at destination.');
+        }
         // Check if there are more units in the queue
-        if (autoMoveQueue.length > 0) {
+        else if (autoMoveQueue.length > 0) {
           const [nextId, ...rest] = autoMoveQueue;
           setAutoMoveQueue(rest);
           setAutoMovingUnitId(nextId);
-          
+
           // Center on next unit
           const nextUnit = result.newState.units.find(u => u.id === nextId);
           if (nextUnit) centerOnUnit(nextUnit);
         } else {
           // No more units to auto-move
           setAutoMovingUnitId(null);
-          
+
           // Find next available unit
           const nextState = advanceToNextUnit(result.newState, true);
           setGameState(nextState);
-          
+
           if (!result.message) {
             setMessage('Your turn.');
           }
@@ -720,7 +767,7 @@ export default function StrategicConquestGame() {
         if (unit) centerOnUnit(unit);
       }
     }, 150); // 150ms delay between steps for visibility
-    
+
     return () => clearTimeout(timer);
   }, [autoMovingUnitId, gameState, autoMoveQueue, executeOneAutoMoveStep, advanceToNextUnit, centerOnUnit, checkForVisibleEnemies]);
   
@@ -869,6 +916,27 @@ export default function StrategicConquestGame() {
       }
       
       if (move.isAttack) {
+        // NUKE: Bomber destroys all units and neutralizes all cities in 3x3 blast area
+        if (spec.isNuke) {
+          const cx = move.x, cy = move.y;
+          newUnits = newUnits.filter(u =>
+            Math.abs(u.x - cx) > 1 || Math.abs(u.y - cy) > 1
+          );
+          for (let dy = -1; dy <= 1; dy++) {
+            for (let dx = -1; dx <= 1; dx++) {
+              const bx = cx + dx, by = cy + dy;
+              const ck = `${bx},${by}`;
+              if (newCities[ck]) {
+                newCities[ck] = { ...newCities[ck], owner: 'neutral', producing: null, progress: {} };
+                newMap[by][bx] = NEUTRAL_CITY;
+              }
+            }
+          }
+          unitDestroyed = true;
+          setMessage('NUCLEAR STRIKE! Everything in the blast radius is destroyed!');
+          return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true);
+        }
+
         if (move.isCity) {
           // City attack
           const ck = `${move.x},${move.y}`;
@@ -981,13 +1049,18 @@ export default function StrategicConquestGame() {
                 shouldMove = false;
               } else {
                 const targetTile = prev.map[move.y][move.x];
+                const targetCityKey = `${move.x},${move.y}`;
+                const targetCity = newCities[targetCityKey];
+                const isFriendlyCity = targetCity && targetCity.owner === unit.owner;
                 if (spec.isNaval && targetTile !== WATER) {
-                  const targetCityKey = `${move.x},${move.y}`;
-                  const targetCity = newCities[targetCityKey];
-                  const isFriendlyCity = targetCity && targetCity.owner === unit.owner;
+                  // Naval units can't move onto land; only friendly cities are valid
                   if (!isFriendlyCity) {
                     shouldMove = false;
                   }
+                } else if (spec.isLand && targetCity && !isFriendlyCity) {
+                  // Land units must explicitly attack a hostile city — killing a
+                  // unit garrisoned there does not auto-capture it
+                  shouldMove = false;
                 }
               }
             } else { 
@@ -1234,7 +1307,9 @@ export default function StrategicConquestGame() {
   
   const handleEndTurn = useCallback(() => {
     if (!gameState) return;
-    setExploredTiles(prev => updateExploredTiles(updateExploredTiles(prev, turnVisibility), currentVisibility));
+    // Compute updated explored tiles synchronously (setExploredTiles is async)
+    const updatedExplored = updateExploredTiles(updateExploredTiles(exploredTiles, turnVisibility), currentVisibility);
+    setExploredTiles(updatedExplored);
     setTurnVisibility(new Set());
     setBombardMode(false); // Exit bombard mode on turn end
     
@@ -1312,32 +1387,54 @@ export default function StrategicConquestGame() {
       console.warn('[AUTOSAVE] Failed:', e);
     }
 
-    // BUG #4 FIX: Queue units with GoTo/Patrol for auto-move at turn start
-    const autoMoveUnits = newState.units.filter(u => 
-      u.owner === 'player' && 
-      u.movesLeft > 0 && 
-      !u.aboardId &&
-      (u.status === STATUS_GOTO || u.status === STATUS_PATROL)
-    );
-    
-    if (autoMoveUnits.length > 0) {
-      // Queue all auto-move units
-      const ids = autoMoveUnits.map(u => u.id);
-      setAutoMoveQueue(ids.slice(1)); // Rest go in queue
-      setAutoMovingUnitId(ids[0]); // Start with first
-      setMessage(`Turn ${newState.turn}. Executing auto-moves...`);
-    } else {
-      const nextId = findNextUnit(newState, null, false);
-      if (nextId) { 
-        const nu = newState.units.find(u => u.id === nextId); 
-        if (nu) centerOnUnit(nu); 
-        newState = { ...newState, activeUnitId: nextId }; 
+    // Turn start: run observer turn, or queue auto-moves, or advance to next unit
+    if (aiObserverMode) {
+      // Seed observer knowledge with all tiles the player has explored so far
+      const seedKnowledge = observerKnowledge
+        ? { ...observerKnowledge, exploredTiles: new Set([...observerKnowledge.exploredTiles, ...updatedExplored]) }
+        : createObserverKnowledge(newState, updatedExplored);
+      const obsResult = executeObserverTurn(newState, seedKnowledge);
+      newState = obsResult.state;
+      setObserverKnowledge(obsResult.observerKnowledge);
+      setExploredTiles(new Set(obsResult.observerKnowledge.exploredTiles));
+      setObserverTrails(obsResult.trails);
+      // Mark all trail tiles as visible this turn so they show bright (FOG_VISIBLE)
+      if (obsResult.trails.length > 0) {
+        const trailVisible = new Set();
+        for (const obs of obsResult.trails) {
+          for (const pos of obs.trail) {
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+              trailVisible.add(`${pos.x + dx},${pos.y + dy}`);
+            }
+          }
+        }
+        setTurnVisibility(prev => new Set([...prev, ...trailVisible]));
       }
-      setMessage(`Turn ${newState.turn}. Your turn.`);
+      setMessage(`Turn ${newState.turn}. Observer: moves done. Press End Turn.`);
+    } else {
+      // BUG #4 FIX: Queue units with GoTo/Patrol for auto-move at turn start
+      const autoMoveUnits = newState.units.filter(u =>
+        u.owner === 'player' && u.movesLeft > 0 && !u.aboardId &&
+        (u.status === STATUS_GOTO || u.status === STATUS_PATROL)
+      );
+      if (autoMoveUnits.length > 0) {
+        const ids = autoMoveUnits.map(u => u.id);
+        setAutoMoveQueue(ids.slice(1));
+        setAutoMovingUnitId(ids[0]);
+        setMessage(`Turn ${newState.turn}. Executing auto-moves...`);
+      } else {
+        const nextId = findNextUnit(newState, null, false);
+        if (nextId) {
+          const nu = newState.units.find(u => u.id === nextId);
+          if (nu) centerOnUnit(nu);
+          newState = { ...newState, activeUnitId: nextId };
+        }
+        setMessage(`Turn ${newState.turn}. Your turn.`);
+      }
     }
-    
+
     setGameState(newState);
-  }, [gameState, currentVisibility, turnVisibility, aiKnowledge, centerOnUnit, playerMadeContact, playerObservations]);
+  }, [gameState, currentVisibility, turnVisibility, exploredTiles, aiKnowledge, centerOnUnit, playerMadeContact, playerObservations, aiObserverMode, observerKnowledge]);
   
   // Resume auto-move for current unit (after enemy spotted)
   const handleResumeAutoMove = useCallback(() => {
@@ -1389,8 +1486,8 @@ export default function StrategicConquestGame() {
     const handleKey = (e) => {
       if (phase !== PHASE_PLAYING || !gameState) return;
       
-      // Don't process keys while auto-moving (except escape)
-      if (autoMovingUnitId && e.key.toLowerCase() !== 'escape') return;
+      // Don't process keys while auto-moving (except escape and observer toggle)
+      if (autoMovingUnitId && e.key.toLowerCase() !== 'escape' && e.key.toLowerCase() !== 'o') return;
       
       const key = e.key.toLowerCase(), numKey = parseInt(e.key);
       if (DIRECTIONS[numKey]) { const { dx, dy } = DIRECTIONS[numKey]; handleMove(dx, dy); return; }
@@ -1474,15 +1571,46 @@ export default function StrategicConquestGame() {
           }
           handleEndTurn(); 
           break;
-        case 'escape': 
-          setGotoMode(false); 
-          setPatrolMode(false); 
+        case 'o':
+          if (!aiObserverMode) {
+            setAiObserverMode(true);
+            // Only run the observer turn if player units still have moves left.
+            // If all units are at movesLeft=0, observer already ran this turn
+            // and re-running would give every unit a free double-move.
+            const anyMovesLeft = gameState.units.some(
+              u => u.owner === 'player' && !u.aboardId && u.movesLeft > 0
+            );
+            if (anyMovesLeft) {
+              activateObserverMoves(gameState);
+            } else {
+              setMessage('Observer mode ON. Moves already done this turn. Press End Turn.');
+            }
+          } else {
+            setAiObserverMode(false);
+            setObserverTrails([]);
+            setAutoMovingUnitId(null);
+            setAutoMoveQueue([]);
+            // Clear observer-assigned goto paths, return units to ready
+            setGameState(prev => ({
+              ...prev,
+              units: prev.units.map(u =>
+                u.owner === 'player' && u.status === STATUS_GOTO
+                  ? { ...u, gotoPath: null, status: STATUS_READY }
+                  : u
+              )
+            }));
+            setMessage('AI Observer Mode OFF. Your turn.');
+          }
+          break;
+        case 'escape':
+          setGotoMode(false);
+          setPatrolMode(false);
           setBombardMode(false); // Exit bombard mode
-          setPatrolWaypoints([]); 
-          setHoverTarget(null); 
-          setShowCityDialog(null); 
-          setShowUnitView(null); 
-          setShowCityList(false); 
+          setPatrolWaypoints([]);
+          setHoverTarget(null);
+          setShowCityDialog(null);
+          setShowUnitView(null);
+          setShowCityList(false);
           setShowAllUnits(false);
           // Stop auto-movement on escape
           if (autoMovingUnitId) {
@@ -1494,7 +1622,7 @@ export default function StrategicConquestGame() {
       }
     };
     window.addEventListener('keydown', handleKey); return () => window.removeEventListener('keydown', handleKey);
-  }, [phase, gameState, activeUnit, gotoMode, patrolMode, bombardMode, patrolWaypoints, handleMove, handleEndTurn, advanceToNextUnit, autoMovingUnitId, handleResumeAutoMove, aiObservations]);
+  }, [phase, gameState, activeUnit, gotoMode, patrolMode, bombardMode, patrolWaypoints, handleMove, handleEndTurn, advanceToNextUnit, autoMovingUnitId, handleResumeAutoMove, aiObservations, aiObserverMode, activateObserverMoves]);
   
   // BUG #8 FIX: Handle mouse move for goto preview and coordinate display
   const handleTileHover = useCallback((x, y) => {
@@ -1629,6 +1757,7 @@ export default function StrategicConquestGame() {
         homeIslandCities: new Set(Array.isArray(rawAiKnowledge.homeIslandCities) ? rawAiKnowledge.homeIslandCities : []),
         lostCities: new Set(Array.isArray(rawAiKnowledge.lostCities) ? rawAiKnowledge.lostCities : []),
         knownCities: new Set(Array.isArray(rawAiKnowledge.knownCities) ? rawAiKnowledge.knownCities : []),
+        activeMissions: rawAiKnowledge.activeMissions || {},
         // Also restore island-level Sets (handles old saves where Sets became {} objects)
         islands: (rawAiKnowledge.islands || []).map(island => ({
           ...island,
@@ -1640,7 +1769,7 @@ export default function StrategicConquestGame() {
       setAiKnowledge(restoredAiKnowledge);
       console.log('[LoadGame] Restored AI knowledge with', restoredAiKnowledge.exploredTiles.size, 'explored tiles');
     } else {
-      setAiKnowledge(createAIKnowledge());
+      setAiKnowledge(createAIKnowledgeFromState(saveData.gameState));
     }
     
     // Reset turn visibility (will be recalculated)
@@ -1690,12 +1819,12 @@ export default function StrategicConquestGame() {
   return (
     <div ref={containerRef} style={{ display: 'flex', gap: '12px', padding: '12px', backgroundColor: COLORS.background, minHeight: '100vh', fontFamily: 'Monaco, monospace', color: COLORS.text }} tabIndex={0}>
       <div style={{ width: 180, display: 'flex', flexDirection: 'column', gap: '12px' }}>
-        <TurnInfo 
-          turn={gameState.turn} 
+        <TurnInfo
+          turn={gameState.turn}
           phase={phase}
           unitsWaiting={unitsWaiting}
-          playerCities={cityCounts.player} 
-          aiCities={cityCounts.ai} 
+          playerCities={cityCounts.player}
+          aiCities={cityCounts.ai}
           neutralCities={cityCounts.neutral}
           onEndTurn={handleEndTurn}
           onShowCityList={() => setShowCityList(true)}
@@ -1703,6 +1832,8 @@ export default function StrategicConquestGame() {
           onShowAiSummary={() => setShowAiSummary(true)}
           onSaveGame={handleSaveGame}
           hasAiObservations={aiObservations.length > 0 || aiCombatEvents.length > 0}
+          aiObserverMode={aiObserverMode}
+          onToggleObserverMode={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: 'o' }))}
         />
         <UnitInfoPanel unit={activeUnit} units={gameState.units} gameState={gameState} />
         <CommandMenu 
@@ -1744,8 +1875,23 @@ export default function StrategicConquestGame() {
             );
           }))}
           {(() => {
+            // Friendly units with sub-detection capability (for stealth filtering)
+            const subDetectors = gameState.units.filter(u =>
+              u.owner === 'player' && !u.aboardId && UNIT_SPECS[u.type]?.detectsSubs
+            );
             const visibleUnits = gameState.units
-              .filter(u => !u.aboardId && u.x >= viewportX && u.x < viewportX + VIEWPORT_TILES_X && u.y >= viewportY && u.y < viewportY + VIEWPORT_TILES_Y && (u.owner === 'player' || fog[u.y]?.[u.x] === FOG_VISIBLE))
+              .filter(u => {
+                if (u.aboardId) return false;
+                if (u.x < viewportX || u.x >= viewportX + VIEWPORT_TILES_X) return false;
+                if (u.y < viewportY || u.y >= viewportY + VIEWPORT_TILES_Y) return false;
+                if (u.owner === 'player') return true; // always show own units
+                if (fog[u.y]?.[u.x] !== FOG_VISIBLE) return false;
+                // Enemy subs are stealthy: only visible when a friendly detector is adjacent
+                if (UNIT_SPECS[u.type]?.stealth) {
+                  return subDetectors.some(d => Math.abs(d.x - u.x) <= 1 && Math.abs(d.y - u.y) <= 1);
+                }
+                return true;
+              })
               .sort((a, b) => (a.id === gameState.activeUnitId ? 1 : 0) - (b.id === gameState.activeUnitId ? 1 : 0));
             // Per-tile stack counts and top unit (last in sorted order wins visually)
             const tileStack = {};
@@ -1763,6 +1909,59 @@ export default function StrategicConquestGame() {
           })()}
           {(gotoMode || dragging) && previewTarget && activeUnit && gotoPreview && <GotoLineOverlay sx={getUnitLocation(activeUnit, gameState.units).x} sy={getUnitLocation(activeUnit, gameState.units).y} ex={previewTarget.x} ey={previewTarget.y} vx={viewportX} vy={viewportY} dist={gotoPreview.dist} turns={gotoPreview.turns} />}
           {patrolMode && patrolWaypoints.length > 0 && <PatrolOverlay waypoints={patrolWaypoints} vx={viewportX} vy={viewportY} />}
+          {/* Observer mode: show all player goto paths as teal dashed lines */}
+          {aiObserverMode && (() => {
+            const gotoUnits = gameState.units.filter(u => u.owner === 'player' && u.gotoPath?.length > 0 && !u.aboardId);
+            if (gotoUnits.length === 0) return null;
+            return (
+              <svg style={{ position: 'absolute', left: 0, top: 0, width: VIEWPORT_TILES_X * TILE_WIDTH, height: VIEWPORT_TILES_Y * TILE_HEIGHT, pointerEvents: 'none' }}>
+                {gotoUnits.map(u => {
+                  const dest = u.gotoPath[u.gotoPath.length - 1];
+                  const x1 = (u.x - viewportX + 0.5) * TILE_WIDTH;
+                  const y1 = (u.y - viewportY + 0.5) * TILE_HEIGHT;
+                  const x2 = (dest.x - viewportX + 0.5) * TILE_WIDTH;
+                  const y2 = (dest.y - viewportY + 0.5) * TILE_HEIGHT;
+                  return (
+                    <g key={u.id}>
+                      <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="rgba(0,200,200,0.5)" strokeWidth="1.5" strokeDasharray="4,3" />
+                      <circle cx={x2} cy={y2} r={3} fill="rgba(0,200,200,0.8)" />
+                    </g>
+                  );
+                })}
+              </svg>
+            );
+          })()}
+          {/* Observer mode: render movement trails in teal */}
+          {aiObserverMode && observerTrails.length > 0 && observerTrails.map((obs, obsIdx) => (
+            <svg key={`obs-trail-${obsIdx}`} style={{ position: 'absolute', left: 0, top: 0, width: VIEWPORT_TILES_X * TILE_WIDTH, height: VIEWPORT_TILES_Y * TILE_HEIGHT, pointerEvents: 'none' }}>
+              {obs.trail.map((pos, idx) => {
+                if (idx === 0) return null;
+                const prev = obs.trail[idx - 1];
+                const x1 = (prev.x - viewportX + 0.5) * TILE_WIDTH;
+                const y1 = (prev.y - viewportY + 0.5) * TILE_HEIGHT;
+                const x2 = (pos.x - viewportX + 0.5) * TILE_WIDTH;
+                const y2 = (pos.y - viewportY + 0.5) * TILE_HEIGHT;
+                return (
+                  <g key={idx}>
+                    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="rgba(0, 180, 180, 0.8)" strokeWidth="3" strokeLinecap="round" />
+                    <circle cx={x2} cy={y2} r={4} fill="rgba(0, 180, 180, 0.9)" />
+                  </g>
+                );
+              })}
+              {obs.trail.length > 0 && (
+                <rect
+                  x={(obs.trail[0].x - viewportX) * TILE_WIDTH + 2}
+                  y={(obs.trail[0].y - viewportY) * TILE_HEIGHT + 2}
+                  width={TILE_WIDTH - 4}
+                  height={TILE_HEIGHT - 4}
+                  fill="none"
+                  stroke="rgba(0, 180, 180, 0.9)"
+                  strokeWidth="2"
+                  strokeDasharray="4,2"
+                />
+              )}
+            </svg>
+          ))}
           {/* BUG #2 FIX: Render observation trails from AI turn */}
           {aiObservations.length > 0 && aiObservations.map((obs, obsIdx) => (
             <svg key={`obs-${obsIdx}`} style={{ position: 'absolute', left: 0, top: 0, width: VIEWPORT_TILES_X * TILE_WIDTH, height: VIEWPORT_TILES_Y * TILE_HEIGHT, pointerEvents: 'none' }}>
@@ -1810,9 +2009,13 @@ export default function StrategicConquestGame() {
               </div>
             )}
           </div>
-          <div style={{ fontSize: '10px', color: COLORS.text, lineHeight: 1.4, minHeight: '28px' }}>{message}</div>
+          <div style={{ fontSize: '10px', lineHeight: 1.5, minHeight: '56px' }}>
+            {[...messageLog].reverse().map((msg, i) => (
+              <div key={i} style={{ color: i === 0 ? COLORS.text : COLORS.textMuted, opacity: i === 0 ? 1 : 0.6 - i * 0.15 }}>{msg}</div>
+            ))}
+          </div>
         </div>
-        <div style={{ backgroundColor: COLORS.panel, border: `1px solid ${COLORS.border}`, padding: '8px', fontSize: '9px', color: COLORS.textMuted }}><div style={{ marginBottom: '4px', fontWeight: '600' }}>Keys:</div><div>W=Wait K=Skip N=Next</div><div>S=Sentry G=GoTo P=Patrol</div><div>U=Unload C=Cities V=Units</div><div>B=Bombard R=Resume A=AI</div><div>Enter=End Turn</div></div>
+        <div style={{ backgroundColor: COLORS.panel, border: `1px solid ${COLORS.border}`, padding: '8px', fontSize: '9px', color: COLORS.textMuted }}><div style={{ marginBottom: '4px', fontWeight: '600' }}>Keys:</div><div>W=Wait K=Skip N=Next</div><div>S=Sentry G=GoTo P=Patrol</div><div>U=Unload C=Cities V=Units</div><div>B=Bombard R=Resume A=AI</div><div>O=Observer Enter=End Turn</div></div>
       </div>
       {showCityDialog && <CityProductionDialog city={gameState.cities[showCityDialog]} cityKey={showCityDialog} map={gameState.map} width={gameState.width} height={gameState.height} units={gameState.units} fogArray={fog} onClose={() => setShowCityDialog(null)} onSetProduction={handleSetProduction} onMakeActive={handleMakeActive} />}
       {showUnitView && <UnitViewDialog x={showUnitView.x} y={showUnitView.y} map={gameState.map} width={gameState.width} height={gameState.height} units={gameState.units} fogArray={fog} onClose={() => setShowUnitView(null)} onMakeActive={handleMakeActive} />}

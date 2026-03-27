@@ -106,6 +106,7 @@ export const UNIT_SPECS = {
     fuel: 30,
     productionDays: 25,
     isAir: true,
+    isNuke: true,
     icon: 'B',
     attackRolls: 1,
     defenseRolls: 0,
@@ -244,7 +245,7 @@ export const MAP_SIZES = {
 export const TERRAIN_TYPES = {
   wet: { waterRatio: 0.85, label: 'Wet (85% water)' },
   normal: { waterRatio: 0.80, label: 'Normal (80% water)' },
-  dry: { waterRatio: 0.75, label: 'Dry (75% water)' },
+  dry: { waterRatio: 0.70, label: 'Dry (70% water)' },
 };
 
 // Difficulty settings

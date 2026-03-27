@@ -13,8 +13,8 @@
 
 import {
   WATER, LAND, NEUTRAL_CITY, PLAYER_CITY, AI_CITY, UNIT_SPECS, ALL_DIRS,
-  STATUS_READY, STATUS_GOTO, STATUS_USED, STATUS_SKIPPED, STATUS_ABOARD,
-  manhattanDistance
+  STATUS_READY, STATUS_GOTO, STATUS_USED, STATUS_SKIPPED, STATUS_ABOARD, STATUS_SENTRY,
+  manhattanDistance, CITY_COMBAT, BASE_HIT_CHANCE, NAVAL_VS_LAND_HIT_CHANCE
 } from './game-constants.js';
 // Movement engine not directly needed - managers use ai-helpers
 import { calculateVisibility } from './fog-of-war.js';
@@ -22,11 +22,11 @@ import { calculateVisibility } from './fog-of-war.js';
 // AI modules
 import {
   PHASE, AI_CONFIG, TARGET_DIST, TACTICAL_ALLOCATION,
-  log, logPhase, logMission, logTurnSummary,
-  findNearest, floodFillLand, getMoveToward, clearPathCache,
+  log, logPhase, logMission, logTurnSummary, logObs,
+  floodFillLand, getMoveToward, clearPathCache,
   evaluateCombat, getAdjacentEnemies,
   getAdjacentPlayerUnits, isAdjacentToPlayerCity,
-  getRefuelPoints, findNearestUnexplored, findBestExploreTarget
+  getRefuelPoints, findNearestUnexplored, findBestExploreTarget, findCoastExploreTarget
 } from './ai-helpers.js';
 import { planProduction } from './ai-city-manager.js';
 import { assignExplorationMissions, updateIslandKnowledge } from './ai-exploration-manager.js';
@@ -41,19 +41,20 @@ export const getAIConfig = () => ({ ...AI_CONFIG });
 // AI KNOWLEDGE
 // ============================================================================
 
-export function createAIKnowledge(startX, startY) {
+export function createAIKnowledge(startX, startY, homeIslandTiles = null, homeIslandCityKeys = null) {
   return {
     exploredTiles: new Set(),
     startPosition: (startX != null && startY != null) ? { x: startX, y: startY } : null,
     explorationPhase: PHASE.LAND,
     hasSeenPlayerUnit: false,
     hasSeenPlayerCity: false,
-    homeIslandTiles: null,
-    homeIslandCities: new Set(),
+    homeIslandTiles: homeIslandTiles || null,
+    homeIslandCities: homeIslandCityKeys ? new Set(homeIslandCityKeys) : new Set(),
     lostCities: new Set(),
     lastTurnObservations: [],
     knownCities: new Set(),
-    islands: []  // Partial island tracking
+    islands: [],  // Partial island tracking
+    activeMissions: {}  // Persisted transport missions: unitId -> mission (survives between turns)
   };
 }
 
@@ -65,7 +66,17 @@ export function getAIStartPosition(gameState) {
 
 export function createAIKnowledgeFromState(gameState) {
   const startPos = getAIStartPosition(gameState);
-  const k = createAIKnowledge(startPos?.x, startPos?.y);
+  // Compute home island from clean initial state so it isn't corrupted by later game events
+  let homeIslandTiles = null;
+  let homeIslandCityKeys = null;
+  if (startPos) {
+    homeIslandTiles = floodFillLand(startPos.x, startPos.y, gameState);
+    homeIslandCityKeys = [];
+    for (const key of homeIslandTiles) {
+      if (gameState.cities[key]) homeIslandCityKeys.push(key);
+    }
+  }
+  const k = createAIKnowledge(startPos?.x, startPos?.y, homeIslandTiles, homeIslandCityKeys);
   const visibility = calculateVisibility(gameState, 'ai');
   for (const key of visibility) {
     k.exploredTiles.add(key);
@@ -76,6 +87,91 @@ export function createAIKnowledgeFromState(gameState) {
 
 export function recordPlayerObservations(k, observations) {
   return { ...k, lastTurnObservations: observations };
+}
+
+// ============================================================================
+// MID-TURN EVENT HELPERS
+// ============================================================================
+
+/**
+ * Find nearest unexplored tile reachable from the unit's current position
+ * (constrained to the provided flood-fill reachable set for land units).
+ */
+function findNearestReachableUnexplored(unit, state, knowledge, reachableSet) {
+  const { width, height } = state;
+  let best = null, bestDist = Infinity;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (knowledge.exploredTiles.has(`${x},${y}`)) continue;
+      if (!reachableSet.has(`${x},${y}`)) continue;
+      const dist = manhattanDistance(unit.x, unit.y, x, y);
+      if (dist < bestDist) { bestDist = dist; best = { x, y }; }
+    }
+  }
+  return best;
+}
+
+/**
+ * Resolve city capture combat using the same dice rules as the player.
+ * City has strength 1, 1 defense die, defenseDamagePerHit 1.
+ * Returns { cityDead, attRem }.
+ */
+function resolveAICityAttack(attacker) {
+  const spec = UNIT_SPECS[attacker.type];
+  const aRatio = attacker.strength / spec.strength;
+  const aRolls = spec.halfStrengthCombat
+    ? Math.max(1, Math.ceil(attacker.strength * 0.5))
+    : Math.max(1, Math.round(spec.attackRolls * aRatio));
+  // City always has 1 defense roll at full strength (matches CITY_COMBAT spec)
+  const dRolls = CITY_COMBAT.defenseRolls;
+
+  let dmgToDef = 0, dmgToAtt = 0;
+  for (let i = 0; i < aRolls; i++) if (Math.random() < BASE_HIT_CHANCE) dmgToDef += spec.damagePerHit;
+  for (let i = 0; i < dRolls; i++) if (Math.random() < BASE_HIT_CHANCE) dmgToAtt += CITY_COMBAT.defenseDamagePerHit;
+
+  return {
+    cityDead: dmgToDef >= CITY_COMBAT.strength,
+    attRem: Math.max(0, attacker.strength - dmgToAtt)
+  };
+}
+
+/**
+ * When a capturable city is discovered mid-turn, redirect the nearest eligible
+ * AI tank on the same landmass from its current explore mission to capture it.
+ * Only tanks with low-priority explore missions are candidates (not units already
+ * assigned to capture/garrison/high-priority tasks).
+ */
+function redirectNearestTankToCapture(state, knowledge, missions, cx, cy) {
+  const cityLandmass = floodFillLand(cx, cy, state);
+  let bestTank = null, bestDist = Infinity;
+
+  for (const unit of state.units) {
+    if (unit.owner !== 'ai' || unit.type !== 'tank' || unit.aboardId) continue;
+    if (unit.movesLeft <= 0) continue;
+    if (!cityLandmass.has(`${unit.x},${unit.y}`)) continue;
+
+    // Only redirect low-priority explore missions — don't override capture/garrison/combat
+    const mission = missions.get(unit.id);
+    const mType = mission?.mission?.type;
+    if (mType === 'capture_city' || mType === 'attack_city' || mType === 'garrison') continue;
+
+    const dist = manhattanDistance(unit.x, unit.y, cx, cy);
+    if (dist < bestDist) { bestDist = dist; bestTank = unit; }
+  }
+
+  if (bestTank) {
+    log(`City discovery event: redirecting tank#${bestTank.id} → capture (${cx},${cy})`);
+    missions.set(bestTank.id, {
+      mission: {
+        type: 'capture_city',
+        target: { x: cx, y: cy },
+        targetKey: `${cx},${cy}`,
+        priority: 7,
+        assignedBy: 'event',
+        reason: `discovered city (${cx},${cy})`
+      }
+    });
+  }
 }
 
 // ============================================================================
@@ -127,14 +223,22 @@ function updateAIKnowledge(k, state) {
     }
   }
 
-  // Home island init
+  // Home island init (fallback if not seeded at game creation)
   if (!knowledge.homeIslandTiles && knowledge.startPosition) {
     knowledge.homeIslandTiles = floodFillLand(knowledge.startPosition.x, knowledge.startPosition.y, state);
     log(`Home island: ${knowledge.homeIslandTiles.size} tiles`);
+  }
+  // Update homeIslandCities each turn — catches newly-discovered cities on home island
+  if (knowledge.homeIslandTiles) {
     for (const key of knowledge.homeIslandTiles) {
-      if (state.cities[key]) knowledge.homeIslandCities.add(key);
+      if (state.cities[key] && !knowledge.homeIslandCities.has(key)) {
+        knowledge.homeIslandCities.add(key);
+        log(`Home island city discovered: ${key}`);
+      }
     }
-    log(`Home island cities: ${knowledge.homeIslandCities.size}`);
+    if (knowledge.homeIslandCities.size === 0) {
+      log(`Home island cities: 0 (warning: no cities found on home island)`);
+    }
   }
 
   // Update island tracking
@@ -282,7 +386,7 @@ function allocateUnits(state, phase) {
 // STEP-BY-STEP MOVEMENT EXECUTION
 // ============================================================================
 
-function executeStepByStepMovements(state, knowledge, turnLog, missions) {
+function executeStepByStepMovements(state, knowledge, turnLog, missions, observerMode = false) {
   const MAX_MOVES = 20;
   let s = { ...state, units: [...state.units], cities: { ...state.cities }, map: state.map.map(r => [...r]) };
   let k = {
@@ -296,6 +400,16 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
   const observations = [];
   const combatEvents = [];  // Track detailed combat results for player report
   let threats = detectThreats(s, k);
+
+  // Observer mode: track every tile visited per unit
+  const observerPositionLog = new Map();
+  if (observerMode) {
+    for (const unit of s.units) {
+      if (unit.owner === 'ai' && !unit.aboardId) {
+        observerPositionLog.set(unit.id, [{ x: unit.x, y: unit.y }]);
+      }
+    }
+  }
 
   // Observation tracking
   const observationState = new Map();
@@ -311,6 +425,16 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
     }
   }
 
+  // Helper: record position after each move in observer mode
+  const trackPos = (unitId) => {
+    if (!observerMode) return;
+    const u = s.units.find(u => u.id === unitId);
+    if (u) {
+      const log = observerPositionLog.get(unitId);
+      if (log) log.push({ x: u.x, y: u.y });
+    }
+  };
+
   for (let movesRequired = MAX_MOVES; movesRequired >= 1; movesRequired--) {
     const unitsWithMoves = s.units.filter(u =>
       u.owner === 'ai' && !u.aboardId && u.movesLeft === movesRequired
@@ -322,6 +446,18 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
       if (unitIdx < 0) continue;
       const unit = s.units[unitIdx];
       if (unit.movesLeft !== movesRequired) continue;
+
+      // === PRE-MOVEMENT: Transport load check ===
+      // If transport is at a pickup city (arrived last turn), load tanks NOW before deciding where to go
+      if (UNIT_SPECS[unit.type]?.carriesTanks) {
+        const currentMission = missions.get(unit.id)?.mission;
+        if (currentMission?.type === 'transport_pickup' && currentMission.pickupCity) {
+          const [pcx, pcy] = currentMission.pickupCity.split(',').map(Number);
+          if (manhattanDistance(unit.x, unit.y, pcx, pcy) <= 1) {
+            s = handleTransportAutoLoad(s, unitIdx, turnLog, currentMission);
+          }
+        }
+      }
 
       // === PRE-MOVEMENT: Transport unload check ===
       // If transport has cargo and is adjacent to a capturable city, unload NOW
@@ -366,18 +502,31 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
 
       if (decision.action === 'capture') {
         const t = decision.target;
-        turnLog.push(`${unit.type} captured city at ${t.x},${t.y}`);
         const cityKey = `${t.x},${t.y}`;
-        s.cities = { ...s.cities, [cityKey]: { ...t.city, owner: 'ai', producing: 'tank', progress: {} } };
-        s.map[t.y][t.x] = AI_CITY;
-        // Refuel any friendly aircraft on the newly captured city tile
-        s.units = s.units.map(u => {
-          if (u.x === t.x && u.y === t.y && u.owner === 'ai' && !u.aboardId && UNIT_SPECS[u.type].isAir && UNIT_SPECS[u.type].fuel) {
-            return { ...u, fuel: UNIT_SPECS[u.type].fuel };
-          }
-          return u;
-        });
-        s.units = s.units.filter(u => u.id !== unit.id);
+        const combatResult = resolveAICityAttack(unit);
+
+        if (combatResult.cityDead) {
+          // Capture successful
+          turnLog.push(`${unit.type} captured city at ${t.x},${t.y}`);
+          s.cities = { ...s.cities, [cityKey]: { ...t.city, owner: 'ai', producing: 'tank', progress: {} } };
+          s.map[t.y][t.x] = AI_CITY;
+          // Refuel any friendly aircraft on the newly captured city tile
+          s.units = s.units.map(u => {
+            if (u.x === t.x && u.y === t.y && u.owner === 'ai' && !u.aboardId && UNIT_SPECS[u.type].isAir && UNIT_SPECS[u.type].fuel) {
+              return { ...u, fuel: UNIT_SPECS[u.type].fuel };
+            }
+            return u;
+          });
+          s.units = s.units.filter(u => u.id !== unit.id); // tank becomes garrison
+        } else if (combatResult.attRem <= 0) {
+          // Tank destroyed in failed assault
+          turnLog.push(`${unit.type} destroyed assaulting city at ${t.x},${t.y}`);
+          s.units = s.units.filter(u => u.id !== unit.id);
+        } else {
+          // Capture failed — tank takes damage, will retry next turn
+          turnLog.push(`${unit.type} failed to capture city at ${t.x},${t.y} (str ${combatResult.attRem} remaining)`);
+          s.units[unitIdx] = { ...unit, strength: combatResult.attRem, movesLeft: 0, status: STATUS_USED };
+        }
         continue;
       }
 
@@ -387,12 +536,73 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
         const avoidTiles = UNIT_SPECS[unit.type]?.carriesTanks ? getNavalDangerZone(s, k) : null;
         const moveTarget = getMoveToward(unit, decision.target, s, avoidTiles);
         if (moveTarget) {
-          s = executeMove(s, unitIdx, moveTarget, unit, turnLog, observationState);
+          if (observerMode) logObs(`    #${unit.id} ${unit.type}@(${unit.x},${unit.y})→(${moveTarget.x},${moveTarget.y}) [${decision.reason}] moves=${unit.movesLeft - 1}${unit.fuel != null ? ` fuel=${unit.fuel - 1}` : ''}`);
+          s = executeMove(s, unitIdx, moveTarget, unit, turnLog, observationState, missions.get(unit.id)?.mission);
+          trackPos(unit.id);
         } else {
-          // No valid move (unreachable target or completely surrounded) — consume all moves
-          // so the unit does not waste further attempts this turn. Mission will be
-          // recalculated next turn; the exploration manager will pick a reachable target.
-          s.units[unitIdx] = { ...unit, movesLeft: 0, status: STATUS_USED };
+          // getMoveToward returned null: the assigned target is unreachable (e.g. explore
+          // target just became explored by this unit's own vision, or target is on a
+          // different land mass). Clear the stale mission and try a fallback before stalling.
+          missions.delete(unit.id);
+          let rescued = false;
+          const spec = UNIT_SPECS[unit.type];
+
+          if (spec?.isLand) {
+            const reachable = floodFillLand(unit.x, unit.y, s);
+            const altTarget = findNearestReachableUnexplored(unit, s, k, reachable);
+            if (altTarget) {
+              const altMove = getMoveToward(unit, altTarget, s, null);
+              if (altMove) {
+                s = executeMove(s, unitIdx, altMove, unit, turnLog, observationState, null);
+                trackPos(unit.id);
+                rescued = true;
+              }
+            }
+          } else if (spec.isNaval) {
+            const altTarget = findBestExploreTarget(unit, s, k, 'water');
+            if (altTarget) {
+              const altMove = getMoveToward(unit, altTarget, s, null);
+              if (altMove) {
+                s = executeMove(s, unitIdx, altMove, unit, turnLog, observationState, null);
+                trackPos(unit.id);
+                rescued = true;
+              }
+            }
+          } else if (spec.isAir) {
+            // Air units: find nearest unexplored (fuel permitting) or return to base
+            const refuelPoints = getRefuelPoints(s);
+            const chebDistLocal = (ax, ay, bx, by) => Math.max(Math.abs(ax - bx), Math.abs(ay - by));
+            const nearestRefuel = refuelPoints.reduce((best, p) => {
+              const d = chebDistLocal(unit.x, unit.y, p.x, p.y);
+              const bestD = best ? chebDistLocal(unit.x, unit.y, best.x, best.y) : Infinity;
+              return d < bestD ? p : best;
+            }, null);
+            const distToRefuel = nearestRefuel
+              ? chebDistLocal(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y) : Infinity;
+            if (nearestRefuel && unit.fuel - distToRefuel > 4) {
+              const altTarget = findNearestUnexplored(unit, s, k);
+              if (altTarget) {
+                const altMove = getMoveToward(unit, altTarget, s, null);
+                if (altMove) {
+                  s = executeMove(s, unitIdx, altMove, unit, turnLog, observationState, null);
+                  trackPos(unit.id);
+                  rescued = true;
+                }
+              }
+            }
+            if (!rescued && nearestRefuel && distToRefuel > 0) {
+              const altMove = getMoveToward(unit, nearestRefuel, s, null);
+              if (altMove) {
+                s = executeMove(s, unitIdx, altMove, unit, turnLog, observationState, null);
+                trackPos(unit.id);
+                rescued = true;
+              }
+            }
+          }
+
+          if (!rescued) {
+            s.units[unitIdx] = { ...unit, movesLeft: 0, status: STATUS_USED };
+          }
         }
       }
     }
@@ -404,7 +614,13 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
       k.exploredTiles.add(key);
       if (s.cities[key] && !k.knownCities.has(key)) {
         k.knownCities.add(key);
-        log(`Discovered city at ${key} (owner: ${s.cities[key].owner})`);
+        const discoveredCity = s.cities[key];
+        log(`Discovered city at ${key} (owner: ${discoveredCity.owner})`);
+        // Mid-turn event: capturable city discovered → redirect nearest eligible tank
+        if (discoveredCity.owner === 'neutral' || discoveredCity.owner === 'player') {
+          const [cx, cy] = key.split(',').map(Number);
+          redirectNearestTankToCapture(s, k, missions, cx, cy);
+        }
       }
     }
     const newTiles = k.exploredTiles.size - prevSize;
@@ -448,7 +664,7 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions) {
     }
   }
 
-  return { state: s, knowledge: k, observations, combatEvents };
+  return { state: s, knowledge: k, observations, combatEvents, observerPositionLog };
 }
 
 // ============================================================================
@@ -462,13 +678,50 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
   const aiCities = Object.values(state.cities).filter(c => c.owner === 'ai');
 
   // ===== FUEL CRITICAL =====
+  // chebDist helper for Chebyshev (8-directional) fuel planning
+  const chebDist = (ax, ay, bx, by) => Math.max(Math.abs(ax - bx), Math.abs(ay - by));
+  let _nearestRefuel = null; // cached for per-step check below
   if (spec.fuel) {
     const refuelPoints = getRefuelPoints(state);
     if (refuelPoints.length > 0) {
-      const nearestRefuel = findNearest(unit, refuelPoints);
-      const distToRefuel = nearestRefuel ? manhattanDistance(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y) : Infinity;
-      if (unit.fuel <= distToRefuel + 4) {
-        return { action: 'move_toward', target: nearestRefuel, reason: 'fuel_critical' };
+      // Use Chebyshev distance for aircraft — matches actual fuel cost (diagonal moves allowed)
+      _nearestRefuel = refuelPoints.reduce((best, p) => {
+        const d = chebDist(unit.x, unit.y, p.x, p.y);
+        const bestD = best ? chebDist(unit.x, unit.y, best.x, best.y) : Infinity;
+        return d < bestD ? p : best;
+      }, null);
+      const distToRefuel = _nearestRefuel
+        ? chebDist(unit.x, unit.y, _nearestRefuel.x, _nearestRefuel.y)
+        : Infinity;
+      if (unit.fuel <= distToRefuel + 2) {
+        return { action: 'move_toward', target: _nearestRefuel, reason: 'fuel_critical' };
+      }
+    }
+  }
+
+  // ===== REPAIR RETREAT =====
+  // Naval units (not air) retreat to a city when badly damaged, then stay until
+  // healed to 75%+ before resuming. This prevents oscillation where the mission
+  // system immediately pulls the unit back out before it can heal.
+  if (spec.isNaval && !spec.isAir) {
+    const inAICity = state.cities[`${unit.x},${unit.y}`]?.owner === 'ai';
+    const healThreshold = spec.strength * 0.75;
+    const retreatThreshold = spec.strength * 0.5;
+
+    if (inAICity && unit.strength < healThreshold) {
+      // Already at a repair city — stay until healed to 75%+
+      return { action: 'wait', reason: 'repairing_in_city' };
+    }
+
+    if (!inAICity && unit.strength < retreatThreshold) {
+      // Below 50% and not in a city — retreat to nearest AI city
+      const repairTarget = aiCities.reduce((best, c) => {
+        const d = manhattanDistance(unit.x, unit.y, c.x, c.y);
+        return (!best || d < best.d) ? { x: c.x, y: c.y, d } : best;
+      }, null);
+      if (repairTarget) {
+        log(`[REPAIR] ${spec.name}#${unit.id} at ${unit.strength}/${spec.strength} hp retreating to (${repairTarget.x},${repairTarget.y})`);
+        return { action: 'move_toward', target: repairTarget, reason: 'repair_retreat' };
       }
     }
   }
@@ -599,44 +852,105 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
   if (assignment?.mission?.target) {
     const m = assignment.mission;
 
-    // For aircraft following missions, check fuel allows it
-    if (spec.fuel) {
-      const refuelPoints = getRefuelPoints(state);
-      const nearestRefuel = findNearest(unit, refuelPoints);
-      if (nearestRefuel) {
-        const distToRefuel = manhattanDistance(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y);
-        const fuelAfterReturn = unit.fuel - distToRefuel;
-        if (fuelAfterReturn <= 4) {
-          // Must return to refuel instead of following mission
-          return { action: 'move_toward', target: nearestRefuel, reason: 'fuel_return' };
+    // If the unit has already reached its mission target, clear it.
+    // Rebase missions: stop here to refuel (next turn will assign a new spoke).
+    // Explore missions: fall through so remaining moves explore productively.
+    if (unit.x === m.target.x && unit.y === m.target.y) {
+      missions.delete(unit.id);
+      if (m.type === 'rebase') {
+        return { action: 'wait', reason: 'rebase_complete' };
+      }
+      // Island coast mission reached — immediately find the next coast segment
+      // rather than falling through to generic water exploration, which would
+      // send the destroyer away from the island mid-circumnavigation.
+      if (m.type === 'explore_island_coast') {
+        const partialIslands = (knowledge.islands || []).filter(i => !i.fullyMapped && i.tiles.size > 0);
+        for (const island of partialIslands) {
+          const next = findCoastExploreTarget(unit, state, knowledge, island.tiles);
+          if (next) {
+            // Commit as a new mission so remaining steps this turn don't re-evaluate
+            missions.set(unit.id, {
+              mission: { type: 'explore_island_coast', target: next, priority: 5, assignedBy: 'default', reason: 'island_coast_continue' }
+            });
+            return { action: 'move_toward', target: next, reason: 'island_coast_continue' };
+          }
+        }
+        // Island fully mapped — fall through to general exploration
+      }
+      // Loaded transport with explore_sector reached: chain to next water target
+      // instead of falling to island_coast_default which picks backward coast tiles.
+      if (m.type === 'explore_sector' && spec.carriesTanks) {
+        const cargo = state.units.filter(cu => cu.aboardId === unit.id);
+        if (cargo.length > 0) {
+          const nextTarget = findBestExploreTarget(unit, state, knowledge, 'water');
+          if (nextTarget) {
+            missions.set(unit.id, {
+              mission: { type: 'explore_sector', target: nextTarget, priority: 3, assignedBy: 'default', reason: 'transport_explore_with_cargo' }
+            });
+            return { action: 'move_toward', target: nextTarget, reason: 'transport_explore_with_cargo' };
+          }
         }
       }
-    }
+      // Fall through to NO MISSION section below
+    } else {
+      // Per-step fuel safety for aircraft: before committing to the next step,
+      // estimate where we'd be (one Chebyshev step toward mission target) and
+      // verify we can still return to the nearest refuel point from there.
+      if (spec.fuel && _nearestRefuel && m.type !== 'rebase') {
+        const dx = Math.sign(m.target.x - unit.x);
+        const dy = Math.sign(m.target.y - unit.y);
+        const nextDistToRefuel = chebDist(unit.x + dx, unit.y + dy, _nearestRefuel.x, _nearestRefuel.y);
+        if (unit.fuel - 1 < nextDistToRefuel + 2) {
+          return { action: 'move_toward', target: _nearestRefuel, reason: 'fuel_return_next_step' };
+        }
+      }
 
-    return { action: 'move_toward', target: m.target, reason: m.reason || m.type };
+      return { action: 'move_toward', target: m.target, reason: m.reason || m.type };
+    }
   }
 
   // ===== NO MISSION - DEFAULT BEHAVIOR =====
 
-  // Fighters with no mission: find nearest unexplored
+  // Fighters with no mission: find nearest unexplored, per-step fuel check
   if (unit.type === 'fighter') {
-    const refuelPoints = getRefuelPoints(state);
-    const nearestRefuel = findNearest(unit, refuelPoints);
-    if (nearestRefuel) {
-      const distToRefuel = manhattanDistance(unit.x, unit.y, nearestRefuel.x, nearestRefuel.y);
-      if (unit.fuel - distToRefuel > 4) {
-        const target = findNearestUnexplored(unit, state, knowledge);
-        if (target) return { action: 'move_toward', target, reason: 'explore_default' };
+    if (_nearestRefuel) {
+      const target = findNearestUnexplored(unit, state, knowledge);
+      if (target) {
+        const dx = Math.sign(target.x - unit.x);
+        const dy = Math.sign(target.y - unit.y);
+        const nextDistToRefuel = chebDist(unit.x + dx, unit.y + dy, _nearestRefuel.x, _nearestRefuel.y);
+        if (unit.fuel - 1 >= nextDistToRefuel + 2) {
+          return { action: 'move_toward', target, reason: 'explore_default' };
+        }
       }
-      if (distToRefuel > 0) return { action: 'move_toward', target: nearestRefuel, reason: 'return_base' };
+      const distToRefuel = chebDist(unit.x, unit.y, _nearestRefuel.x, _nearestRefuel.y);
+      if (distToRefuel > 0) return { action: 'move_toward', target: _nearestRefuel, reason: 'return_base' };
     }
     return { action: 'wait', reason: 'fighter_at_base' };
   }
 
-  // Naval with no mission: explore water
+  // Naval with no mission: finish any partial island circumnavigation first,
+  // then fall back to general water exploration.
+  // IMPORTANT: commit the chosen target as a mission so subsequent steps this turn
+  // don't re-evaluate and reverse direction as nearby coast tiles get explored.
   if (spec.isNaval) {
+    const partialIslands = (knowledge.islands || []).filter(i => !i.fullyMapped && i.tiles.size > 0);
+    for (const island of partialIslands) {
+      const coastTarget = findCoastExploreTarget(unit, state, knowledge, island.tiles);
+      if (coastTarget) {
+        missions.set(unit.id, {
+          mission: { type: 'explore_island_coast', target: coastTarget, priority: 5, assignedBy: 'default', reason: 'island_coast_default' }
+        });
+        return { action: 'move_toward', target: coastTarget, reason: 'island_coast_default' };
+      }
+    }
     const target = findBestExploreTarget(unit, state, knowledge, 'water');
-    if (target) return { action: 'move_toward', target, reason: 'explore_water_default' };
+    if (target) {
+      missions.set(unit.id, {
+        mission: { type: 'explore_water', target, priority: 3, assignedBy: 'default', reason: 'explore_water_default' }
+      });
+      return { action: 'move_toward', target, reason: 'explore_water_default' };
+    }
   }
 
   // Tank with no mission: explore land
@@ -655,7 +969,7 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
 // MOVEMENT HELPERS
 // ============================================================================
 
-function executeMove(state, unitIdx, moveTarget, unit, turnLog, observationState) {
+function executeMove(state, unitIdx, moveTarget, unit, turnLog, observationState, mission) {
   let s = { ...state, units: [...state.units] };
   const spec = UNIT_SPECS[unit.type];
 
@@ -680,10 +994,9 @@ function executeMove(state, unitIdx, moveTarget, unit, turnLog, observationState
     }
   }
 
-  // Transport auto-loading
+  // Transport auto-loading: only load when at or adjacent to pickup city (not while en route)
   if (spec.carriesTanks) {
-    s = handleTransportAutoLoad(s, unitIdx, turnLog);
-    s = handleTransportAutoUnload(s, unitIdx, turnLog).state;
+    s = handleTransportAutoLoad(s, unitIdx, turnLog, mission);
   }
 
   // Observation tracking
@@ -701,8 +1014,15 @@ function updateObservation(observationState, unitId, x, y, forcedObserved, state
     return;
   }
   if (state) {
-    const obs = getAdjacentPlayerUnits(x, y, state.units);
-    const nearCity = isAdjacentToPlayerCity(x, y, state.cities);
+    const aiUnit = state.units.find(u => u.id === unitId);
+    const aiSpec = aiUnit ? UNIT_SPECS[aiUnit.type] : null;
+    const allObs = getAdjacentPlayerUnits(x, y, state.units);
+    // Stealthy AI units (subs) can only be spotted by player units with detectsSubs
+    const obs = aiSpec?.stealth
+      ? allObs.filter(pu => UNIT_SPECS[pu.type]?.detectsSubs)
+      : allObs;
+    // Cities also can't detect submerged submarines
+    const nearCity = !aiSpec?.stealth && isAdjacentToPlayerCity(x, y, state.cities);
     if (obs.length > 0 || nearCity) {
       obsState.wasObserved = true;
       obsState.observers.push(...obs);
@@ -723,18 +1043,65 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
   const unit = s.units[unitIdx];
   const attSpec = UNIT_SPECS[unit.type], defSpec = UNIT_SPECS[target.type];
 
+  // NUKE: Bomber destroys all units and neutralizes all cities in 3x3 blast area
+  if (attSpec.isNuke) {
+    const cx = next.x, cy = next.y;
+    s.units = s.units.filter(u => Math.abs(u.x - cx) > 1 || Math.abs(u.y - cy) > 1);
+    let newCities = { ...s.cities };
+    let newMap = s.map.map(row => [...row]);
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const bx = cx + dx, by = cy + dy;
+        const ck = `${bx},${by}`;
+        if (newCities[ck]) {
+          newCities[ck] = { ...newCities[ck], owner: 'neutral', producing: null, progress: {} };
+          if (by >= 0 && by < newMap.length && bx >= 0 && bx < newMap[0].length) {
+            newMap[by][bx] = NEUTRAL_CITY;
+          }
+        }
+      }
+    }
+    s.cities = newCities;
+    s.map = newMap;
+    turnLog.push(`NUKE: Bomber obliterated area around (${cx},${cy})`);
+    return {
+      state: s,
+      attackerDestroyed: true,
+      combatEvent: {
+        location: { x: cx, y: cy },
+        isNuke: true,
+        attacker: { type: unit.type, owner: unit.owner, startStrength: unit.strength, endStrength: 0, destroyed: true },
+        defender: { type: target.type, owner: target.owner, startStrength: target.strength, endStrength: 0, destroyed: true }
+      }
+    };
+  }
+
   // Store pre-combat state for reporting
   const attackerStartStrength = unit.strength;
   const defenderStartStrength = target.strength;
 
-  let attRolls = attSpec.strength >= 10 ? Math.ceil(attSpec.strength * 0.5) : 1;
-  let defRolls = defSpec.strength >= 10 ? Math.ceil(defSpec.strength * 0.5) : 1;
-  let attRem = unit.strength, defRem = target.strength;
+  // Roll calculation mirrors player's simulateCombatWithDefender exactly.
+  const aRatio = unit.strength / attSpec.strength;
+  const dRatio = target.strength / defSpec.strength;
+  let attRolls = attSpec.halfStrengthCombat
+    ? Math.max(1, Math.ceil(unit.strength * 0.5))
+    : Math.max(1, Math.round((attSpec.attackRolls || 1) * aRatio));
+  let defRolls = defSpec.halfStrengthCombat
+    ? Math.max(1, Math.ceil(target.strength * 0.5))
+    : Math.max(0, Math.round((defSpec.defenseRolls || 1) * dRatio));
 
-  for (let r = 0; r < Math.max(attRolls, defRolls); r++) {
-    if (r < attRolls && Math.random() < 0.5) defRem--;
-    if (r < defRolls && Math.random() < 0.5) attRem--;
-  }
+  // Submarine stealth: defender can't shoot back unless it has sub-detection
+  if (attSpec.stealth && !defSpec.detectsSubs) defRolls = 0;
+
+  // Naval vs land: both sides hit less often (sea-to-shore difficulty)
+  const aHit = (attSpec.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
+  const dHit = (defSpec.isNaval && attSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
+
+  let dmgToDef = 0, dmgToAtt = 0;
+  for (let i = 0; i < attRolls; i++) if (Math.random() < aHit) dmgToDef += (attSpec.damagePerHit || 1);
+  for (let i = 0; i < defRolls; i++) if (Math.random() < dHit) dmgToAtt += (defSpec.defenseDamagePerHit || 1);
+  let attRem = Math.max(0, unit.strength - dmgToAtt);
+  let defRem = Math.max(0, target.strength - dmgToDef);
 
   turnLog.push(`COMBAT: ${unit.type}(str ${unit.strength}) vs ${target.type}(str ${target.strength}) -> att=${attRem} def=${defRem}`);
 
@@ -772,7 +1139,12 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
   } else {
     const newIdx = s.units.findIndex(x => x.id === unit.id);
     if (newIdx >= 0) {
-      s.units[newIdx] = { ...s.units[newIdx], strength: attRem, movesLeft: 0, gotoPath: null, status: STATUS_USED };
+      // Multi-attack rule (mirrors player logic):
+      // First attack on a fresh unit costs 1 move; any subsequent attack exhausts all moves.
+      const hasAlreadyActed = unit.movesLeft < attSpec.movement;
+      const newMovesLeft = (!hasAlreadyActed && unit.movesLeft > 1) ? unit.movesLeft - 1 : 0;
+      const newStatus = newMovesLeft === 0 ? STATUS_USED : unit.status;
+      s.units[newIdx] = { ...s.units[newIdx], strength: attRem, movesLeft: newMovesLeft, gotoPath: null, status: newStatus };
       if (defRem <= 0) {
         const remaining = s.units.filter(eu => eu.x === next.x && eu.y === next.y && eu.owner !== 'ai' && !eu.aboardId);
         if (remaining.length === 0) {
@@ -830,26 +1202,31 @@ function tryTransportUnload(state, unitIdx, turnLog, missions) {
     const defenders = s.units.filter(d => d.x === adjX && d.y === adjY && d.owner === 'player' && !d.aboardId);
     if (defenders.length > 0) continue; // Can't unload into defended city
 
-    log(`[TRANSPORT] Unloading at (${unit.x},${unit.y}) -> city ${cityKey}`);
-    let captured = false;
+    // Use the first tank to assault the city — goes through city combat like a regular capture
+    const assaultTank = cargo[0];
+    const assaultIdx = s.units.findIndex(x => x.id === assaultTank.id);
+    if (assaultIdx < 0) continue;
 
-    for (const tank of cargo) {
-      const tankIdx = s.units.findIndex(x => x.id === tank.id);
-      if (tankIdx < 0) continue;
-
-      if (!captured) {
-        const targetCity = city || { owner: 'neutral' };
-        turnLog.push(`Transport invasion: captured ${targetCity.owner} city ${cityKey}`);
-        s.cities = { ...s.cities, [cityKey]: { ...targetCity, x: adjX, y: adjY, owner: 'ai', producing: 'tank', progress: {} } };
-        s.map[adjY][adjX] = AI_CITY;
-        s.units = s.units.filter(x => x.id !== tank.id); // Tank consumed by capture
-        captured = true;
+    const combatResult = resolveAICityAttack(s.units[assaultIdx]);
+    if (!combatResult.cityDead) {
+      // City defended — tank takes damage and stays aboard; transport will retry next turn
+      const tankRem = combatResult.attRem;
+      turnLog.push(`Transport assault on ${cityKey} repelled (tank str ${tankRem} remaining)`);
+      if (tankRem <= 0) {
+        s.units = s.units.filter(x => x.id !== assaultTank.id);
       } else {
-        // Additional tanks disembark onto the city tile
-        s.units[tankIdx] = { ...s.units[tankIdx], aboardId: null, x: adjX, y: adjY, status: STATUS_READY, movesLeft: 0 };
-        turnLog.push(`Transport unloaded tank#${tank.id} at ${cityKey}`);
+        s.units[assaultIdx] = { ...s.units[assaultIdx], strength: tankRem };
       }
+      return { state: s, unloaded: true }; // transport is done for this turn
     }
+
+    log(`[TRANSPORT] Unloading at (${unit.x},${unit.y}) -> city ${cityKey}`);
+    const targetCity = city || { owner: 'neutral' };
+    turnLog.push(`Transport invasion: captured ${targetCity.owner} city ${cityKey}`);
+    s.cities = { ...s.cities, [cityKey]: { ...targetCity, x: adjX, y: adjY, owner: 'ai', producing: 'tank', progress: {} } };
+    s.map[adjY][adjX] = AI_CITY;
+    s.units = s.units.filter(x => x.id !== assaultTank.id); // First tank consumed as garrison
+    // Remaining tanks stay aboard — transport will seek the next city next turn
 
     return { state: s, unloaded: true };
   }
@@ -894,10 +1271,11 @@ function tryTransportUnload(state, unitIdx, turnLog, missions) {
     if (bestLand) {
       log(`[TRANSPORT] Coastal unload at (${unit.x},${unit.y}) -> land (${bestLand.x},${bestLand.y}) for march to city ${mission.targetKey}`);
 
-      for (const tank of cargo) {
-        const tankIdx = s.units.findIndex(x => x.id === tank.id);
-        if (tankIdx < 0) continue;
-
+      // Only unload one tank per turn — it marches overland while the rest stay
+      // aboard so the transport can continue to other cities without returning to pick up tanks
+      const tank = cargo[0];
+      const tankIdx = s.units.findIndex(x => x.id === tank.id);
+      if (tankIdx >= 0) {
         s.units[tankIdx] = {
           ...s.units[tankIdx],
           aboardId: null,
@@ -915,14 +1293,30 @@ function tryTransportUnload(state, unitIdx, turnLog, missions) {
   return { state: s, unloaded: false };
 }
 
-function handleTransportAutoLoad(state, unitIdx, turnLog) {
+function handleTransportAutoLoad(state, unitIdx, turnLog, mission) {
   let s = { ...state, units: [...state.units] };
   const unit = s.units[unitIdx];
   const capacity = UNIT_SPECS[unit.type].capacity;
 
+  // Only load tanks when on an explicit transport_pickup mission AND adjacent to the
+  // pickup city. Loading during exploration/ferry/other missions causes phantom cargo
+  // accumulation and makes tanks appear to teleport onto the transport.
+  if (mission?.type !== 'transport_pickup') return s;
+  const pickupCity = mission.pickupCity;
+  if (!pickupCity) return s;
+  const [pcx, pcy] = pickupCity.split(',').map(Number);
+  if (manhattanDistance(unit.x, unit.y, pcx, pcy) > 1) return s;
+
   for (const [dx, dy] of ALL_DIRS) {
     const adjX = unit.x + dx, adjY = unit.y + dy;
     if (s.map[adjY]?.[adjX] === WATER) continue;
+
+    // Don't load from a tile that has adjacent enemy units — the city is under threat
+    const tileThreats = s.units.filter(u => {
+      if (u.owner !== 'player' || u.aboardId) return false;
+      return ALL_DIRS.some(([ex, ey]) => u.x === adjX + ex && u.y === adjY + ey);
+    });
+    if (tileThreats.length > 0) continue;
 
     const tanksToLoad = s.units.filter(tank =>
       tank.x === adjX && tank.y === adjY && tank.type === 'tank' && tank.owner === 'ai' && !tank.aboardId
@@ -941,57 +1335,11 @@ function handleTransportAutoLoad(state, unitIdx, turnLog) {
   return s;
 }
 
-function handleTransportAutoUnload(state, unitIdx, turnLog) {
-  let s = { ...state, units: [...state.units], cities: { ...state.cities }, map: state.map.map(r => [...r]) };
-  const unit = s.units[unitIdx];
-  const cargo = s.units.filter(cu => cu.aboardId === unit.id);
-  if (cargo.length === 0) return { state: s };
-
-  for (const [dx, dy] of ALL_DIRS) {
-    const adjX = unit.x + dx, adjY = unit.y + dy;
-    if (adjX < 0 || adjX >= s.map[0].length || adjY < 0 || adjY >= s.map.length) continue;
-
-    const adjTile = s.map[adjY]?.[adjX];
-    const cityKey = `${adjX},${adjY}`;
-    const city = s.cities[cityKey];
-
-    // Check both map tile AND cities object for capturable city
-    const isCapturable = (adjTile === NEUTRAL_CITY || adjTile === PLAYER_CITY) ||
-                          (city && (city.owner === 'neutral' || city.owner === 'player'));
-    if (!isCapturable) continue;
-
-    const targetCity = city || { owner: 'neutral' };
-    if (targetCity.owner !== 'neutral' && targetCity.owner !== 'player') continue;
-
-    const defenders = s.units.filter(d => d.x === adjX && d.y === adjY && d.owner === 'player' && !d.aboardId);
-    let captured = false;
-
-    for (const tank of cargo) {
-      const tankIdx = s.units.findIndex(x => x.id === tank.id);
-      if (tankIdx < 0) continue;
-
-      if (!captured && defenders.length === 0) {
-        turnLog.push(`Transport invasion: captured ${targetCity.owner} city ${cityKey}`);
-        s.cities = { ...s.cities, [cityKey]: { ...targetCity, x: adjX, y: adjY, owner: 'ai', producing: 'tank', progress: {} } };
-        s.map[adjY][adjX] = AI_CITY;
-        s.units = s.units.filter(x => x.id !== tank.id);
-        captured = true;
-      } else {
-        s.units[tankIdx] = { ...s.units[tankIdx], aboardId: null, x: adjX, y: adjY, status: STATUS_READY, movesLeft: 0 };
-        turnLog.push(`Transport unloaded tank at ${cityKey}`);
-      }
-    }
-    break;
-  }
-  return { state: s };
-}
-
 // ============================================================================
 // MAIN AI TURN EXECUTION
 // ============================================================================
 
 export function executeAITurn(gameState, knowledge, unused, playerMadeContact = false, playerObservations = []) {
-  const turnStartExplored = knowledge.exploredTiles.size;
   log(`======== AI TURN ${gameState.turn} ========`);
 
   // Clear A* path cache from previous turn (unit positions have changed)
@@ -1042,7 +1390,6 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
 
   // === ALLOCATE UNITS between managers ===
   const { explorationUnits, tacticalUnits } = allocateUnits(state, k.explorationPhase);
-  console.log(`[AI][ALLOC] exploration: ${explorationUnits.length}, tactical: ${tacticalUnits.length}`);
 
   // === Detect threats ===
   const threats = detectThreats(state, k);
@@ -1082,10 +1429,182 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
     }
   }
 
+  // Persist transport missions into knowledge so next turn can avoid redundant reassignment
+  k.activeMissions = {};
+  for (const [id, entry] of allMissions) {
+    if (entry?.mission) k.activeMissions[id] = entry.mission;
+  }
+
   // Exploration delta
-  const newExplored = k.exploredTiles.size - turnStartExplored;
-  const totalTiles = state.width * state.height;
-  const explorePct = (k.exploredTiles.size / totalTiles * 100).toFixed(1);
-  console.log(`[AI][EXPLORE] +${newExplored} tiles this turn -> ${explorePct}% explored`);
   return { state, knowledge: k, log: turnLog, observations, combatEvents };
+}
+
+// ============================================================================
+// OBSERVER TURN — runs the full AI pipeline driving player units
+// ============================================================================
+
+/**
+ * Swap player↔ai owners (units, cities, map tiles) so the AI engine can
+ * operate on player units as if they were its own.
+ */
+function ownerSwap(state) {
+  const swap = o => o === 'player' ? 'ai' : o === 'ai' ? 'player' : o;
+  return {
+    ...state,
+    units: state.units.map(u => ({ ...u, owner: swap(u.owner) })),
+    cities: Object.fromEntries(
+      Object.entries(state.cities).map(([k, c]) => [k, { ...c, owner: swap(c.owner) }])
+    ),
+    map: state.map.map(row =>
+      row.map(t => t === PLAYER_CITY ? AI_CITY : t === AI_CITY ? PLAYER_CITY : t)
+    )
+  };
+}
+
+/**
+ * Create initial observer knowledge for the player's perspective.
+ * Uses the shadow (owner-swapped) state so AI machinery initialises from
+ * the player's starting city and player-unit visibility.
+ */
+export function createObserverKnowledge(gameState, playerExploredTiles) {
+  const shadow = ownerSwap(gameState);
+  const k = createAIKnowledgeFromState(shadow);
+  // Seed with everything the player has ever explored
+  for (const tile of playerExploredTiles) k.exploredTiles.add(tile);
+  return k;
+}
+
+/**
+ * Run the full AI pipeline (production + explore + tactical missions + step-by-step movement)
+ * against player units by operating in a shadow state with owners swapped.
+ * Returns { state, observerKnowledge, log, trails }.
+ */
+export function executeObserverTurn(gameState, observerKnowledge) {
+  clearPathCache();
+  const turnLog = [];
+  const exploredBefore = observerKnowledge.exploredTiles.size;
+  const totalTiles = gameState.width * gameState.height;
+
+  // Shadow state: player ↔ ai
+  let shadow = ownerSwap(gameState);
+
+  // Update knowledge using the shadow state (player units are 'ai' here)
+  let k = updateAIKnowledge(observerKnowledge, shadow);
+
+  // Phase determination: use natural phase, but hold in LAND until
+  // all-but-one home island city is captured (player starts owning their
+  // home city; remaining neutrals need tanks to secure them first).
+  const oldPhase = k.explorationPhase;
+  const naturalPhase = determinePhase(k, shadow);
+  let observerPhase = naturalPhase;
+
+  if (naturalPhase !== PHASE.LAND && k.homeIslandCities && k.homeIslandCities.size > 0) {
+    let uncaptured = 0;
+    for (const key of k.homeIslandCities) {
+      if (shadow.cities[key]?.owner !== 'ai') uncaptured++;
+    }
+    if (uncaptured > 1) observerPhase = PHASE.LAND;
+  }
+
+  k.explorationPhase = observerPhase;
+  const phaseChanged = oldPhase !== k.explorationPhase;
+
+  // === CITY MANAGER: Assign production targets (no progress tick — endPlayerTurn already did it) ===
+  const prodLogStart = turnLog.length;
+  shadow = planProduction(shadow, k, turnLog, false);
+  const prodEvents = turnLog.slice(prodLogStart);
+
+  // === Reset moves, heal, refuel (same as executeAITurn) ===
+  shadow = {
+    ...shadow,
+    units: shadow.units.map(u => {
+      if (u.owner !== 'ai') return u;
+      const spec = UNIT_SPECS[u.type];
+      let movement = spec.movement;
+      if (u.strength <= spec.strength * 0.5) movement = Math.max(1, movement - 1);
+      const unit = { ...u, movesLeft: movement };
+      // Sentry and aboard units don't move (but stay in their status)
+      if (unit.status === STATUS_SENTRY || unit.aboardId) unit.movesLeft = 0;
+      if (unit.status === STATUS_USED || unit.status === STATUS_SKIPPED) unit.status = STATUS_READY;
+      const city = shadow.cities[`${unit.x},${unit.y}`];
+      if (city?.owner === 'ai' && !unit.aboardId) {
+        if (unit.strength < spec.strength) unit.strength = Math.min(spec.strength, unit.strength + 1);
+        if (spec.fuel) unit.fuel = spec.fuel;
+      }
+      return unit;
+    })
+  };
+
+  // Snapshot positions of all eligible units for trail building
+  const startPositions = new Map(
+    shadow.units
+      .filter(u => u.owner === 'ai' && !u.aboardId && u.movesLeft > 0)
+      .map(u => [u.id, { x: u.x, y: u.y, type: u.type }])
+  );
+
+  const phaseNote = observerPhase !== naturalPhase
+    ? ` (forced=${observerPhase}, natural=${naturalPhase})`
+    : phaseChanged ? ` (was ${oldPhase})` : '';
+  logObs(`=== Turn ${gameState.turn} — phase: ${k.explorationPhase}${phaseNote} — ${startPositions.size} units eligible ===`);
+  if (prodEvents.length) logObs(`  production: ${prodEvents.join(' | ')}`);
+
+  const { explorationUnits, tacticalUnits } = allocateUnits(shadow, k.explorationPhase);
+  logObs(`  explore=${explorationUnits.length}u  tactical=${tacticalUnits.length}u`);
+
+  // Assign missions
+  const threats = detectThreats(shadow, k);
+  const explorationMissions = assignExplorationMissions(shadow, k, explorationUnits, k.explorationPhase, turnLog);
+  const tacticalMissions = assignTacticalMissions(shadow, k, tacticalUnits, threats, k.explorationPhase, turnLog);
+  const allMissions = new Map([...explorationMissions, ...tacticalMissions]);
+
+  // Log mission assignments
+  for (const [id, start] of startPositions) {
+    const m = allMissions.get(id);
+    if (m?.mission) {
+      const t = m.mission.target;
+      logObs(`  #${id} ${start.type}@(${start.x},${start.y}) → ${m.mission.type}${t ? ` (${t.x},${t.y})` : ''}`);
+    } else {
+      logObs(`  #${id} ${start.type}@(${start.x},${start.y}) → NO MISSION`);
+    }
+  }
+
+  // Execute all moves
+  const moveResult = executeStepByStepMovements(shadow, k, turnLog, allMissions, true);
+  shadow = moveResult.state;
+  k = moveResult.knowledge;
+
+  // Build full-path trails using per-tile position log
+  const trails = [];
+  const posLog = moveResult.observerPositionLog;
+  for (const [id, start] of startPositions) {
+    const unit = shadow.units.find(u => u.id === id);
+    if (!unit) {
+      logObs(`  #${id} ${start.type} — destroyed/captured`);
+    } else {
+      const history = posLog.get(id) || [];
+      if (history.length > 1) {
+        logObs(`  #${id} ${start.type} (${start.x},${start.y})→(${unit.x},${unit.y}) [${history.length} steps]`);
+        trails.push({ unitId: id, unitType: start.type, trail: history });
+      } else if (unit.x !== start.x || unit.y !== start.y) {
+        logObs(`  #${id} ${start.type} moved (${start.x},${start.y})→(${unit.x},${unit.y})`);
+        trails.push({ unitId: id, unitType: start.type, trail: [{ x: start.x, y: start.y }, { x: unit.x, y: unit.y }] });
+      } else {
+        logObs(`  #${id} ${start.type}@(${start.x},${start.y}) — did not move (status: ${unit.status})`);
+      }
+    }
+  }
+
+  const exploredAfter = k.exploredTiles.size;
+  logObs(`  explored: +${exploredAfter - exploredBefore} tiles → ${(exploredAfter / totalTiles * 100).toFixed(1)}% total`);
+  if (turnLog.length) logObs(`  events: ${turnLog.join(' | ')}`);
+
+  // Persist observer transport missions for next turn continuity
+  k.activeMissions = {};
+  for (const [id, entry] of allMissions) {
+    if (entry?.mission) k.activeMissions[id] = entry.mission;
+  }
+
+  // Swap owners back to restore player/ai context
+  const resultState = ownerSwap(shadow);
+  return { state: resultState, observerKnowledge: k, log: turnLog, trails };
 }

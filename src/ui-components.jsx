@@ -371,19 +371,21 @@ export function UnitSprite({
  * @param {Function} props.onEndTurn - End turn handler
  * @param {Function} props.onShowCityList - Show city list handler
  */
-export function TurnInfo({ 
-  turn, 
-  phase, 
-  unitsWaiting, 
-  playerCities, 
-  aiCities, 
-  neutralCities, 
-  onEndTurn, 
+export function TurnInfo({
+  turn,
+  phase,
+  unitsWaiting,
+  playerCities,
+  aiCities,
+  neutralCities,
+  onEndTurn,
   onShowCityList,
   onShowAllUnits,
   onShowAiSummary,
   onSaveGame,
-  hasAiObservations
+  hasAiObservations,
+  aiObserverMode,
+  onToggleObserverMode
 }) {
   return (
     <div style={{ backgroundColor: COLORS.panel, border: `1px solid ${COLORS.border}`, padding: '10px' }}>
@@ -469,21 +471,40 @@ export function TurnInfo({
       >
         AI Turn [A]
       </button>
+      {/* AI Observer Mode toggle */}
+      <button
+        onClick={onToggleObserverMode}
+        style={{
+          width: '100%',
+          padding: '6px',
+          marginBottom: 6,
+          backgroundColor: aiObserverMode ? 'rgba(0, 180, 180, 0.3)' : COLORS.border,
+          border: aiObserverMode ? '1px solid rgba(0, 180, 180, 0.6)' : 'none',
+          color: aiObserverMode ? 'rgba(0, 220, 220, 1)' : COLORS.textMuted,
+          fontSize: 10,
+          textTransform: 'uppercase',
+          letterSpacing: 1,
+          cursor: 'pointer',
+          fontFamily: 'inherit'
+        }}
+      >
+        Observer [O]
+      </button>
       {/* Save Game button */}
-      <button 
-        onClick={onSaveGame} 
-        style={{ 
-          width: '100%', 
-          padding: '6px', 
-          marginBottom: 6, 
-          backgroundColor: COLORS.border, 
-          border: 'none', 
-          color: COLORS.text, 
-          fontSize: 10, 
-          textTransform: 'uppercase', 
-          letterSpacing: 1, 
-          cursor: 'pointer', 
-          fontFamily: 'inherit' 
+      <button
+        onClick={onSaveGame}
+        style={{
+          width: '100%',
+          padding: '6px',
+          marginBottom: 6,
+          backgroundColor: COLORS.border,
+          border: 'none',
+          color: COLORS.text,
+          fontSize: 10,
+          textTransform: 'uppercase',
+          letterSpacing: 1,
+          cursor: 'pointer',
+          fontFamily: 'inherit'
         }}
       >
         Save Game

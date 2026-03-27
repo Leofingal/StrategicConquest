@@ -10,11 +10,11 @@ import { UNIT_SPECS, ALL_DIRS, WATER, manhattanDistance } from './game-constants
 import { isAdjacentToWater } from './movement-engine.js';
 import { calculateVisibility } from './fog-of-war.js';
 import {
-  PHASE, AI_CONFIG, log,
+  PHASE, AI_CONFIG, log, logAI,
   findNearest, floodFillLand
 } from './ai-helpers.js';
 
-const logTactical = (...args) => console.log('[AI][TACTICAL]', ...args);
+const logTactical = (...args) => logAI('TACTICAL', ...args);
 
 // ============================================================================
 // THREAT DETECTION

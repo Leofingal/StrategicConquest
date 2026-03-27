@@ -26,7 +26,12 @@ const logProd = () => {}; // silenced — summary printed by logTurnSummary
  * @param {Array} turnLog - Turn log array for messages
  * @returns {Object} Updated state with production decisions
  */
-export function planProduction(state, knowledge, turnLog) {
+/**
+ * @param {boolean} [tickProgress=true] - If false, skip the progress increment and
+ *   unit spawning (used by observer mode where endPlayerTurn already ticked progress).
+ *   Only idle cities (producing===null) get a production assignment.
+ */
+export function planProduction(state, knowledge, turnLog, tickProgress = true) {
   let s = { ...state, units: [...state.units], cities: { ...state.cities } };
   const phase = knowledge.explorationPhase;
   const targetDist = TARGET_DIST[phase] || TARGET_DIST[PHASE.LAND];
@@ -55,46 +60,55 @@ export function planProduction(state, knowledge, turnLog) {
   for (const [key, city] of Object.entries(s.cities)) {
     if (city.owner !== 'ai') continue;
 
-    // Step 2a: Check for unit completion
+    // Step 2a: Tick progress / spawn completed units
     if (city.producing) {
-      const spec = UNIT_SPECS[city.producing];
-      if (!spec) continue;
-      const progress = (city.progress?.[city.producing] || 0) + 1;
-
-      if (progress >= spec.productionDays) {
-        // UNIT COMPLETED - spawn it
-        const newUnit = {
-          id: s.nextUnitId++,
-          type: city.producing,
-          owner: 'ai',
-          x: city.x,
-          y: city.y,
-          strength: spec.strength,
-          movesLeft: 0,  // Can't move on spawn turn
-          fuel: spec.fuel || null,
-          status: 'R',
-          aboardId: null,
-          gotoPath: null,
-          patrolPath: null,
-          patrolIdx: 0
-        };
-        s.units.push(newUnit);
-        turnLog.push(`Built ${city.producing} at ${key}`);
-        logProd(`COMPLETED: ${city.producing} at ${key}`);
-
-        // Reset: mark city as needing new assignment
-        s.cities = {
-          ...s.cities,
-          [key]: { ...city, producing: null, progress: { ...city.progress, [city.producing]: 0 } }
-        };
+      if (!tickProgress) {
+        // endPlayerTurn already ticked progress. If it's > 0 the city is mid-production
+        // and committed. If it's 0 the unit just completed last turn (endPlayerTurn reset
+        // progress to 0 but left producing set) — treat as idle so AI can reassign.
+        const currentProgress = city.progress?.[city.producing] || 0;
+        if (currentProgress > 0) continue;
+        // Fall through to Step 2b to reassign this freshly-completed city
       } else {
-        // Increment progress, keep building
-        s.cities = {
-          ...s.cities,
-          [key]: { ...city, progress: { ...city.progress, [city.producing]: progress } }
-        };
-        // City is COMMITTED - skip production assignment
-        continue;
+        const spec = UNIT_SPECS[city.producing];
+        if (!spec) continue;
+        const progress = (city.progress?.[city.producing] || 0) + 1;
+
+        if (progress >= spec.productionDays) {
+          // UNIT COMPLETED - spawn it
+          const newUnit = {
+            id: s.nextUnitId++,
+            type: city.producing,
+            owner: 'ai',
+            x: city.x,
+            y: city.y,
+            strength: spec.strength,
+            movesLeft: 0,  // Can't move on spawn turn
+            fuel: spec.fuel || null,
+            status: 'R',
+            aboardId: null,
+            gotoPath: null,
+            patrolPath: null,
+            patrolIdx: 0
+          };
+          s.units.push(newUnit);
+          turnLog.push(`Built ${city.producing} at ${key}`);
+          logProd(`COMPLETED: ${city.producing} at ${key}`);
+
+          // Reset: mark city as needing new assignment
+          s.cities = {
+            ...s.cities,
+            [key]: { ...city, producing: null, progress: { ...city.progress, [city.producing]: 0 } }
+          };
+        } else {
+          // Increment progress, keep building
+          s.cities = {
+            ...s.cities,
+            [key]: { ...city, progress: { ...city.progress, [city.producing]: progress } }
+          };
+          // City is COMMITTED - skip production assignment
+          continue;
+        }
       }
     }
 

@@ -254,215 +254,163 @@ export function assignExplorationMissions(state, knowledge, units, phase, turnLo
   assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutral, knownPlayer, claimedCities, missions, turnLog);
 
   // ===== TRANSPORTS: Ferry tanks to target cities =====
-  assignTransportMissions(transports, state, knowledge, knownNeutral, knownPlayer, claimedCities, missions, turnLog);
+  const claimedPickupCities = new Set(); // prevent two transports racing to same pickup city
+  assignTransportMissions(transports, state, knowledge, knownNeutral, knownPlayer, claimedCities, claimedPickupCities, missions, turnLog);
 
-  // ===== DESTROYERS (exploration allocation): Explore water / follow island coasts =====
-  assignNavalExplorationMissions(destroyers, state, knowledge, missions, turnLog);
+  // ===== DESTROYERS (exploration allocation): Deep scout in LAND/TRANSITION, coast in NAVAL+ =====
+  assignNavalExplorationMissions(destroyers, state, knowledge, missions, turnLog, true, phase);
 
   // Other naval (carriers in exploration mode) - explore water
-  assignNavalExplorationMissions(otherNaval, state, knowledge, missions, turnLog);
+  assignNavalExplorationMissions(otherNaval, state, knowledge, missions, turnLog, false, phase);
 
   return missions;
 }
 
 // ============================================================================
-// FIGHTER MISSION ASSIGNMENT
+// FIGHTER MISSION ASSIGNMENT — SPOKE PATTERN
 // ============================================================================
+// Each fighter picks an outer AI city as a base and flies SCAN_DEPTH tiles
+// outward in a cardinal direction, shifting the perpendicular offset each turn
+// to cover adjacent strips. Fuel-critical logic returns it to base to refuel.
+// New captured cities automatically extend exploration to the next tier.
 
-function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCities, claimedSectors, missions, turnLog) {
+const FIGHTER_FUEL = 20;
+const FUEL_SAFETY  = 2;                                             // buffer tiles
+const SCAN_DEPTH   = Math.floor((FIGHTER_FUEL - FUEL_SAFETY) / 2); // = 9
+
+// ALL_DIRS includes diagonals, so movement cost = Chebyshev distance (max|dx|,|dy|),
+// not Manhattan. Use chebDist for all fighter fuel calculations.
+const chebDist = (x1, y1, x2, y2) => Math.max(Math.abs(x2 - x1), Math.abs(y2 - y1));
+
+// 8-spoke directions: 4 cardinals + 4 diagonals, each with a perpendicular vector
+const SPOKE_DIRS = [
+  { dx:  1, dy:  0, name: 'E',  perpDx: 0, perpDy:  1 },
+  { dx: -1, dy:  0, name: 'W',  perpDx: 0, perpDy:  1 },
+  { dx:  0, dy: -1, name: 'N',  perpDx: 1, perpDy:  0 },
+  { dx:  0, dy:  1, name: 'S',  perpDx: 1, perpDy:  0 },
+  { dx:  1, dy: -1, name: 'NE', perpDx: 1, perpDy:  1 },
+  { dx: -1, dy: -1, name: 'NW', perpDx: 1, perpDy: -1 },
+  { dx:  1, dy:  1, name: 'SE', perpDx: 1, perpDy: -1 },
+  { dx: -1, dy:  1, name: 'SW', perpDx: 1, perpDy:  1 },
+];
+
+/** Next uncovered perpendicular strip for a spoke from base in direction dir. */
+function findNextSpokeTarget(base, dir, state, knowledge, excluded) {
+  const maxOff = Math.max(state.width, state.height);
+  for (let offset = 0; offset <= maxOff; offset += 2) {
+    const signs = offset === 0 ? [1] : [1, -1];
+    for (const sign of signs) {
+      const po = sign * offset;
+      const tx = base.x + dir.dx * SCAN_DEPTH + dir.perpDx * po;
+      const ty = base.y + dir.dy * SCAN_DEPTH + dir.perpDy * po;
+      if (tx < 0 || tx >= state.width || ty < 0 || ty >= state.height) continue;
+      const key = `${tx},${ty}`;
+      if (knowledge.exploredTiles.has(key) || excluded.has(key)) continue;
+      return { x: tx, y: ty };
+    }
+  }
+  return null;
+}
+
+/** Best (base city, target) spoke for a fighter. */
+function findBestSpoke(fighter, aiCities, refuelPoints, state, knowledge, excluded) {
+  let best = null;
+  let bestScore = -Infinity;
+
+  for (const city of aiCities) {
+    const distToCity = chebDist(fighter.x, fighter.y, city.x, city.y);
+    for (const dir of SPOKE_DIRS) {
+      const target = findNextSpokeTarget(city, dir, state, knowledge, excluded);
+      if (!target) continue;
+
+      // No pre-flight range check — per-step fuel safety in decideNextStep handles it.
+      // Just score by unexplored density and proximity of the base city to the fighter.
+
+      // Density: unexplored tiles in 5×5 around target
+      let density = 0;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const nx = target.x + dx, ny = target.y + dy;
+        if (nx >= 0 && nx < state.width && ny >= 0 && ny < state.height &&
+            !knowledge.exploredTiles.has(`${nx},${ny}`)) density++;
+      }
+      if (density === 0) continue;
+
+      const score = density * 2 - distToCity;
+      if (score > bestScore) { bestScore = score; best = { base: city, target, dir }; }
+    }
+  }
+  return best;
+}
+
+function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCities, _claimedSectors, missions, turnLog) {
   if (fighters.length === 0) return;
-
-  const centerX = knowledge.startPosition?.x || state.width / 2;
-  const centerY = knowledge.startPosition?.y || state.height / 2;
 
   // Check for partially-explored non-home islands (high priority exploration)
   const nonHomeIslands = (knowledge.islands || []).filter(i => !i.isHomeIsland && !i.fullyMapped);
 
-  // Identify frontier cities: AI cities that have unexplored tiles within fighter range
-  const frontierCities = [];
-  for (const city of aiCities) {
-    const maxRange = 9; // half of fuel=20, minus safety
-    let hasUnexplored = false;
-    for (let dy = -maxRange; dy <= maxRange && !hasUnexplored; dy++) {
-      for (let dx = -maxRange; dx <= maxRange && !hasUnexplored; dx++) {
-        const nx = city.x + dx, ny = city.y + dy;
-        if (nx < 0 || nx >= state.width || ny < 0 || ny >= state.height) continue;
-        if (Math.abs(dx) + Math.abs(dy) > maxRange) continue;
-        if (!knowledge.exploredTiles.has(`${nx},${ny}`)) hasUnexplored = true;
-      }
-    }
-    if (hasUnexplored) frontierCities.push(city);
-  }
+  const islandAssignments = new Map(); // islandId -> fighterId (max 1 per island)
+  const claimedTargets = new Set();    // Prevent two fighters targeting same tile
 
-  // Track: max 1 fighter per non-home island
-  const islandAssignments = new Map(); // islandId -> unitId
-
-  // Build a reachability map: for each fighter, compute what it can reach round-trip
-  // from the nearest refuel point (not just from current position)
-  const fighterReach = fighters.map(fighter => {
+  for (const fighter of fighters) {
     const nearestRefuel = findNearest(fighter, refuelPoints);
-    const distToRefuel = nearestRefuel ? manhattanDistance(fighter.x, fighter.y, nearestRefuel.x, nearestRefuel.y) : Infinity;
-    const fuelAfterReturn = fighter.fuel - distToRefuel;
-    // Max exploration radius from nearest refuel point (round trip)
-    const maxExploreRange = nearestRefuel ? Math.floor((fighter.fuel - 4) / 2) : 0;
-    return { fighter, nearestRefuel, distToRefuel, fuelAfterReturn, maxExploreRange };
-  });
-
-  for (const { fighter, nearestRefuel, distToRefuel, fuelAfterReturn, maxExploreRange } of fighterReach) {
     if (!nearestRefuel) {
-      missions.set(fighter.id, { mission: { type: 'wait', reason: 'no_refuel_point' } });
+      missions.set(fighter.id, { mission: { type: 'wait', reason: 'no_refuel', priority: 0, assignedBy: 'exploration' } });
       continue;
     }
 
-    // Priority 0: Return to refuel if fuel critical
-    if (fuelAfterReturn <= 4 && distToRefuel > 0) {
+    const distToRefuel = chebDist(fighter.x, fighter.y, nearestRefuel.x, nearestRefuel.y);
+
+    // Priority 0: Fuel critical — return immediately
+    if (fighter.fuel <= distToRefuel + FUEL_SAFETY) {
       missions.set(fighter.id, {
-        mission: {
-          type: 'rebase',
-          target: { x: nearestRefuel.x, y: nearestRefuel.y },
-          priority: 9,
-          assignedBy: 'exploration',
-          reason: 'fuel_return'
-        }
+        mission: { type: 'rebase', target: { x: nearestRefuel.x, y: nearestRefuel.y }, priority: 9, assignedBy: 'exploration', reason: 'fuel_critical' }
       });
       continue;
     }
 
-    // Priority 1: Non-home island interior (MAX 1 fighter per island)
+    // Priority 1: Non-home island interior (max 1 fighter per island)
     let assignedIsland = false;
-    if (nonHomeIslands.length > 0 && fuelAfterReturn > 4) {
-      for (const island of nonHomeIslands) {
-        if (islandAssignments.has(island.id)) continue; // Already assigned
-
-        const closestIsland = findClosestIslandToExploreFromRefuel(fighter, island, knowledge, state, refuelPoints);
-        if (closestIsland && closestIsland.roundTripFuel <= fighter.fuel - 2) {
-          islandAssignments.set(island.id, fighter.id);
-          missions.set(fighter.id, {
-            mission: {
-              type: 'explore_island_interior',
-              target: closestIsland.target,
-              priority: 8,
-              assignedBy: 'exploration',
-              reason: `island interior (island#${island.id}, rt=${closestIsland.roundTripFuel})`
-            }
-          });
-          logMission(`fighter#${fighter.id}: explore island #${island.id} (round-trip fuel: ${closestIsland.roundTripFuel})`);
-          assignedIsland = true;
-          break;
-        }
+    for (const island of nonHomeIslands) {
+      if (islandAssignments.has(island.id)) continue;
+      const closest = findClosestIslandToExploreFromRefuel(fighter, island, knowledge, state, refuelPoints);
+      if (closest && closest.roundTripFuel + FUEL_SAFETY <= fighter.fuel) {
+        islandAssignments.set(island.id, fighter.id);
+        claimedTargets.add(`${closest.target.x},${closest.target.y}`);
+        missions.set(fighter.id, {
+          mission: { type: 'explore_island_interior', target: closest.target, priority: 8, assignedBy: 'exploration', reason: `island#${island.id} interior` }
+        });
+        logMission(`fighter#${fighter.id}: island#${island.id} interior (rt=${closest.roundTripFuel})`);
+        assignedIsland = true;
+        break;
       }
     }
     if (assignedIsland) continue;
 
-    // Priority 2: Deep scout into an UNCLAIMED sector
-    if (fuelAfterReturn > 4) {
-      // Find sectors not yet claimed by another fighter this turn
-      const target = findDeepScoutTargetInUnclaimedSector(
-        fighter, state, knowledge, refuelPoints, claimedSectors, centerX, centerY
-      );
-      if (target) {
-        const sector = getSectorForPoint(target.x, target.y, centerX, centerY);
-        claimedSectors.set(sector, fighter.id);
-        missions.set(fighter.id, {
-          mission: {
-            type: 'explore_sector',
-            target: { x: target.x, y: target.y },
-            priority: 6,
-            assignedBy: 'exploration',
-            reason: `deep scout ${SECTOR_NAMES[sector]} (dist=${target.dist})`
-          }
-        });
-        logMission(`fighter#${fighter.id}: deep scout ${SECTOR_NAMES[sector]} toward (${target.x},${target.y})`);
-        continue;
-      }
+    // Priority 2: Spoke exploration from best outer city
+    const spoke = findBestSpoke(fighter, aiCities, refuelPoints, state, knowledge, claimedTargets);
+    if (spoke) {
+      const { base, target, dir } = spoke;
+      claimedTargets.add(`${target.x},${target.y}`);
 
-      // Fallback: any deep scout target (all sectors claimed)
-      const fallbackTarget = findDeepScoutTarget(fighter, state, knowledge, refuelPoints);
-      if (fallbackTarget) {
-        missions.set(fighter.id, {
-          mission: {
-            type: 'explore_sector',
-            target: { x: fallbackTarget.x, y: fallbackTarget.y },
-            priority: 6,
-            assignedBy: 'exploration',
-            reason: `deep scout any (dist=${fallbackTarget.dist})`
-          }
-        });
-        logMission(`fighter#${fighter.id}: deep scout any toward (${fallbackTarget.x},${fallbackTarget.y})`);
-        continue;
-      }
-    }
-
-    // Priority 3: Rebase to frontier city with unexplored in range
-    if (frontierCities.length > 0) {
-      // Only consider cities we can actually reach with remaining fuel
-      const reachableFrontier = frontierCities.filter(c =>
-        manhattanDistance(fighter.x, fighter.y, c.x, c.y) <= fighter.fuel - 2
-      );
-      const otherFrontier = reachableFrontier.filter(c =>
-        c.x !== nearestRefuel.x || c.y !== nearestRefuel.y
-      );
-      const rebaseTarget = otherFrontier.length > 0
-        ? findNearest(fighter, otherFrontier)
-        : findNearest(fighter, reachableFrontier);
-
-      if (rebaseTarget) {
-        missions.set(fighter.id, {
-          mission: {
-            type: 'rebase',
-            target: { x: rebaseTarget.x, y: rebaseTarget.y },
-            priority: 5,
-            assignedBy: 'exploration',
-            reason: `rebase to frontier city (${rebaseTarget.x},${rebaseTarget.y})`
-          }
-        });
-        logMission(`fighter#${fighter.id}: rebasing to frontier city (${rebaseTarget.x},${rebaseTarget.y})`);
-        continue;
-      }
-    }
-
-    // Default: nearest unexplored (fallback) - only if round-trip safe
-    const fallback = findNearestUnexplored(fighter, state, knowledge);
-    if (fallback) {
-      const distToFallback = manhattanDistance(fighter.x, fighter.y, fallback.x, fallback.y);
-      let bestReturnDist = Infinity;
-      for (const rp of refuelPoints) {
-        const d = manhattanDistance(fallback.x, fallback.y, rp.x, rp.y);
-        if (d < bestReturnDist) bestReturnDist = d;
-      }
-      if (distToFallback + bestReturnDist + 4 <= fighter.fuel) {
-        missions.set(fighter.id, {
-          mission: {
-            type: 'explore_sector',
-            target: { x: fallback.x, y: fallback.y },
-            priority: 4,
-            assignedBy: 'exploration',
-            reason: 'nearest_unexplored_fallback'
-          }
-        });
-      } else {
-        // Fallback target isn't safely reachable — return to nearest refuel
-        missions.set(fighter.id, {
-          mission: {
-            type: 'rebase',
-            target: { x: nearestRefuel.x, y: nearestRefuel.y },
-            priority: 3,
-            assignedBy: 'exploration',
-            reason: 'return_no_safe_target'
-          }
-        });
-      }
-    } else {
+      // Go straight for the spoke target. Per-step fuel checks in decideNextStep will
+      // turn the fighter around to refuel whenever the next step would be unsafe.
       missions.set(fighter.id, {
-        mission: { type: 'wait', reason: 'nothing_to_explore' }
+        mission: { type: 'explore_sector', target: { x: target.x, y: target.y }, priority: 6, assignedBy: 'exploration', reason: `spoke-${dir.name} from (${base.x},${base.y})` }
       });
+      logMission(`fighter#${fighter.id}: spoke-${dir.name} (${base.x},${base.y})→(${target.x},${target.y})`);
+      continue;
     }
+
+    // No spoke target found — return to refuel
+    missions.set(fighter.id, {
+      mission: { type: 'rebase', target: { x: nearestRefuel.x, y: nearestRefuel.y }, priority: 3, assignedBy: 'exploration', reason: 'all_covered' }
+    });
+    logExplore(`fighter#${fighter.id}: all coverage done, returning`);
   }
 }
 
 /**
- * Find closest unexplored tile near an island that is reachable round-trip
- * (fighter Ã¢â€ â€™ target Ã¢â€ â€™ nearest refuel). Returns null if unreachable.
+ * Find closest unexplored tile near a non-home island reachable round-trip.
  */
 function findClosestIslandToExploreFromRefuel(fighter, island, knowledge, state, refuelPoints) {
   let best = null;
@@ -475,88 +423,45 @@ function findClosestIslandToExploreFromRefuel(fighter, island, knowledge, state,
       if (nx < 0 || nx >= state.width || ny < 0 || ny >= state.height) continue;
       if (knowledge.exploredTiles.has(`${nx},${ny}`)) continue;
 
-      const distToTarget = manhattanDistance(fighter.x, fighter.y, nx, ny);
-
-      // Find nearest refuel from target for return leg
+      const distToTarget = chebDist(fighter.x, fighter.y, nx, ny);
       let bestReturn = Infinity;
       for (const rp of refuelPoints) {
-        const returnDist = manhattanDistance(nx, ny, rp.x, rp.y);
-        if (returnDist < bestReturn) bestReturn = returnDist;
+        const d = chebDist(nx, ny, rp.x, rp.y);
+        if (d < bestReturn) bestReturn = d;
       }
-
       const roundTrip = distToTarget + bestReturn;
       if (roundTrip < bestFuel) {
         bestFuel = roundTrip;
-        best = { target: { x: nx, y: ny }, roundTripFuel: roundTrip, dist: distToTarget };
+        best = { target: { x: nx, y: ny }, roundTripFuel: roundTrip };
       }
     }
   }
   return best;
 }
 
-/**
- * Find a deep scout target in a sector not yet claimed by another fighter.
- * Tries sectors in order of most unexplored tiles.
- */
-function findDeepScoutTargetInUnclaimedSector(fighter, state, knowledge, refuelPoints, claimedSectors, centerX, centerY) {
-  const { width, height } = state;
-
-  // Score sectors
-  const sectorScores = [];
-  for (let s = 0; s < 8; s++) {
-    if (claimedSectors.has(s)) continue; // Already claimed
-    const count = countUnexploredInSector(state, knowledge, centerX, centerY, s);
-    if (count > 0) sectorScores.push({ sector: s, count });
-  }
-  sectorScores.sort((a, b) => b.count - a.count);
-
-  // For each unclaimed sector (best first), find the best deep scout target in it
-  for (const { sector } of sectorScores) {
-    let best = null, bestScore = -Infinity;
-
-    for (let y = 0; y < height; y++) {
-      for (let x = 0; x < width; x++) {
-        if (knowledge.exploredTiles.has(`${x},${y}`)) continue;
-        if (getSectorForPoint(x, y, centerX, centerY) !== sector) continue;
-
-        const distToTarget = manhattanDistance(fighter.x, fighter.y, x, y);
-
-        // Check round-trip fuel
-        let bestReturnDist = Infinity;
-        for (const refuel of refuelPoints) {
-          const returnDist = manhattanDistance(x, y, refuel.x, refuel.y);
-          if (returnDist < bestReturnDist) bestReturnDist = returnDist;
-        }
-
-        if (distToTarget + bestReturnDist + 4 > fighter.fuel) continue;
-
-        // Density bonus
-        let density = 0;
-        for (let dy2 = -2; dy2 <= 2; dy2++) {
-          for (let dx2 = -2; dx2 <= 2; dx2++) {
-            const nx = x + dx2, ny = y + dy2;
-            if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
-              if (!knowledge.exploredTiles.has(`${nx},${ny}`)) density++;
-            }
-          }
-        }
-
-        const score = distToTarget * 2 + density;
-        if (score > bestScore) {
-          bestScore = score;
-          best = { x, y, dist: distToTarget };
-        }
-      }
-    }
-
-    if (best) return best;
-  }
-  return null;
-}
-
 // ============================================================================
 // TANK MISSION ASSIGNMENT
 // ============================================================================
+
+/**
+ * Find the nearest unexplored land tile that is adjacent to water (coastal frontier).
+ * Tanks sent here will trace island outlines first, maximising new tiles revealed per
+ * step and ensuring coastlines are never left behind an inland sweep.
+ */
+function findNearestUnexploredCoast(unit, state, knowledge) {
+  const { width, height, map } = state;
+  let best = null, bestDist = Infinity;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (knowledge.exploredTiles.has(`${x},${y}`)) continue;
+      if (map[y][x] === WATER) continue;
+      if (!isAdjacentToWater(x, y, map, width, height)) continue;
+      const dist = manhattanDistance(unit.x, unit.y, x, y);
+      if (dist < bestDist) { bestDist = dist; best = { x, y, dist }; }
+    }
+  }
+  return best;
+}
 
 function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutral, knownPlayer, claimedCities, missions, turnLog) {
   // Sort tanks by those closest to capturable cities first (greedy assignment)
@@ -579,6 +484,16 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
   const garrisonedCities = new Set();
 
   for (const { tank, reachable, reachableNeutral, reachablePlayer } of tanksByDistance) {
+    // ===== P0: Hold tanks that are staging in a city building a transport =====
+    // If the tank is sitting in an AI city that's currently producing a transport,
+    // keep it there so it gets auto-loaded when the transport spawns.
+    const tankCityKey = `${tank.x},${tank.y}`;
+    const tankCity = state.cities[tankCityKey];
+    if (tankCity?.owner === 'ai' && tankCity.producing === 'transport') {
+      missions.set(tank.id, { mission: { type: 'wait', reason: 'staging_for_transport' } });
+      continue;
+    }
+
     // ===== P1: Capture nearest unclaimed neutral city (always top priority) =====
     let assigned = false;
     for (const city of reachableNeutral) {
@@ -631,30 +546,44 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
     // Every tank should be pushing outward to discover and capture cities.
     // =========================================================================
     if (phase === PHASE.LAND) {
-      const target = findBestExploreTarget(tank, state, knowledge, 'land');
-      if (target && reachable.has(`${target.x},${target.y}`)) {
+      // Find the best explore target — coastal frontier first (traces island outline,
+      // reveals more per step), then nearest unexplored land, then direct reachable scan.
+      let exploreTarget = null;
+      const coastHint = findNearestUnexploredCoast(tank, state, knowledge);
+      if (coastHint && reachable.has(`${coastHint.x},${coastHint.y}`)) {
+        exploreTarget = coastHint;
+      } else {
+        const hint = findBestExploreTarget(tank, state, knowledge, 'land');
+        if (hint && reachable.has(`${hint.x},${hint.y}`)) {
+          exploreTarget = hint;
+        } else {
+          const anyTarget = findNearestUnexplored(tank, state, knowledge);
+          if (anyTarget && reachable.has(`${anyTarget.x},${anyTarget.y}`)) {
+            exploreTarget = anyTarget;
+          } else {
+            // Direct scan: find any unexplored tile within the reachable land area
+            let bestDist = Infinity;
+            for (const key of reachable) {
+              if (knowledge.exploredTiles.has(key)) continue;
+              const [rx, ry] = key.split(',').map(Number);
+              const d = manhattanDistance(tank.x, tank.y, rx, ry);
+              if (d < bestDist) { bestDist = d; exploreTarget = { x: rx, y: ry }; }
+            }
+          }
+        }
+      }
+
+      if (exploreTarget) {
         missions.set(tank.id, {
           mission: {
             type: 'explore_sector',
-            target: { x: target.x, y: target.y },
-            priority: 6,
+            target: { x: exploreTarget.x, y: exploreTarget.y },
+            priority: 5,
             assignedBy: 'exploration',
             reason: 'explore_land'
           }
         });
       } else {
-        const anyTarget = findNearestUnexplored(tank, state, knowledge);
-        if (anyTarget && reachable.has(`${anyTarget.x},${anyTarget.y}`)) {
-          missions.set(tank.id, {
-            mission: {
-              type: 'explore_sector',
-              target: { x: anyTarget.x, y: anyTarget.y },
-              priority: 5,
-              assignedBy: 'exploration',
-              reason: 'explore_any_reachable'
-            }
-          });
-        } else {
           // Island fully explored, no cities left - stage at coast for pickup
           const coastalCities = aiCities.filter(c =>
             reachable.has(`${c.x},${c.y}`) &&
@@ -678,7 +607,6 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
           } else {
             missions.set(tank.id, { mission: { type: 'wait', reason: 'land_phase_complete' } });
           }
-        }
       }
       continue;
     }
@@ -695,7 +623,11 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
     // Tanks landed on a foreign island should explore it to find cities before
     // sitting around waiting for transport pickup
     if (!isOnHomeIsland) {
-      const target = findBestExploreTarget(tank, state, knowledge, 'land');
+      // Coastal-first on foreign islands too — find cities on the outline quickly
+      const coastTarget = findNearestUnexploredCoast(tank, state, knowledge);
+      const target = (coastTarget && reachable.has(`${coastTarget.x},${coastTarget.y}`))
+        ? coastTarget
+        : findBestExploreTarget(tank, state, knowledge, 'land');
       if (target && reachable.has(`${target.x},${target.y}`)) {
         missions.set(tank.id, {
           mission: {
@@ -710,8 +642,8 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
       }
     }
 
-    // === GARRISON: Exactly 1 tank per city ===
-    if (!missions.has(tank.id)) {
+    // === GARRISON: Exactly 1 tank per city (skip in TRANSITION — all tanks should stage) ===
+    if (!missions.has(tank.id) && phase !== PHASE.TRANSITION) {
       for (const city of aiCities) {
         const key = `${city.x},${city.y}`;
         if (garrisonedCities.has(key)) continue;
@@ -868,12 +800,28 @@ function findNearestCoastToCity(city, state, knowledge) {
 // TRANSPORT MISSION ASSIGNMENT
 // ============================================================================
 
-function assignTransportMissions(transports, state, knowledge, knownNeutral, knownPlayer, claimedCities, missions, turnLog) {
+function assignTransportMissions(transports, state, knowledge, knownNeutral, knownPlayer, claimedCities, claimedPickupCities, missions, turnLog) {
+  const activeMissions = knowledge.activeMissions || {};
+
   for (const transport of transports) {
     const cargo = state.units.filter(u => u.aboardId === transport.id);
+    const prevMission = activeMissions[transport.id];
 
     if (cargo.length > 0) {
-      // HAS CARGO - find destination (neutral city preferred, then player city)
+      // HAS CARGO — check if previous ferry_invasion mission is still valid
+      if (prevMission?.type === 'ferry_invasion' && prevMission.targetKey) {
+        const targetCity = state.cities[prevMission.targetKey];
+        const alreadyCaptured = targetCity?.owner === 'ai';
+        const claimedByOther = claimedCities.has(prevMission.targetKey);
+        if (!alreadyCaptured && !claimedByOther) {
+          // Keep the existing mission — don't change destination mid-voyage
+          claimedCities.add(prevMission.targetKey);
+          missions.set(transport.id, { mission: prevMission });
+          continue;
+        }
+      }
+
+      // No valid persisted mission — find best destination (neutral city preferred, then player city)
       const destinations = [...knownNeutral, ...knownPlayer];
       let assigned = false;
 
@@ -950,7 +898,24 @@ function assignTransportMissions(transports, state, knowledge, knownNeutral, kno
         }
       }
     } else {
-      // NO CARGO - go pick up tanks from coastal cities
+      // NO CARGO — check if previous transport_pickup mission is still valid (en route, tanks still there)
+      if (prevMission?.type === 'transport_pickup' && prevMission.pickupCity) {
+        const [pcx, pcy] = prevMission.pickupCity.split(',').map(Number);
+        const atPickup = manhattanDistance(transport.x, transport.y, pcx, pcy) <= 1;
+        const city = state.cities[prevMission.pickupCity];
+        const tanksStillThere = state.units.some(u =>
+          u.x === pcx && u.y === pcy && u.type === 'tank' && u.owner === 'ai' && !u.aboardId
+        );
+        const claimedByOther = claimedPickupCities.has(prevMission.pickupCity);
+        // Keep mission if: not yet at pickup city AND tanks still waiting AND not claimed by another transport
+        if (!atPickup && tanksStillThere && !claimedByOther && city?.owner === 'ai') {
+          claimedPickupCities.add(prevMission.pickupCity);
+          missions.set(transport.id, { mission: prevMission });
+          continue;
+        }
+      }
+
+      // No valid persisted pickup mission — find best pickup from coastal cities
       const aiCities = Object.values(state.cities).filter(c => c.owner === 'ai');
       let assigned = false;
 
@@ -958,25 +923,39 @@ function assignTransportMissions(transports, state, knowledge, knownNeutral, kno
       const pickupCities = [];
       for (const city of aiCities) {
         if (!isAdjacentToWater(city.x, city.y, state.map, state.map[0].length, state.map.length)) continue;
+        const cityKey = `${city.x},${city.y}`;
+        // Don't race another transport already headed to this city
+        if (claimedPickupCities.has(cityKey)) continue;
         const tanksHere = state.units.filter(u =>
           u.x === city.x && u.y === city.y && u.type === 'tank' && u.owner === 'ai' && !u.aboardId
         );
         if (tanksHere.length === 0) continue;
-        pickupCities.push({ city, tankCount: tanksHere.length });
+        // Don't steal from a city that's building its own transport (unless it has < 2 tanks
+        // waiting — too few to fill a load, so help out)
+        if (city.producing === 'transport' && tanksHere.length >= 2) {
+          // Check if the transport being built here isn't already near completion
+          const spec = { productionDays: 10 }; // transport days
+          const progress = city.progress?.transport || 0;
+          const turnsLeft = spec.productionDays - progress;
+          // If the transport will be ready within 5 turns, let those tanks wait for it
+          if (turnsLeft <= 5) continue;
+        }
+        pickupCities.push({ city, cityKey, tankCount: tanksHere.length });
       }
       // Prefer cities with more tanks (fill transport efficiently)
       pickupCities.sort((a, b) => b.tankCount - a.tankCount);
 
-      for (const { city } of pickupCities) {
+      for (const { city, cityKey } of pickupCities) {
         // Find adjacent water tile
         for (const [dx, dy] of ALL_DIRS) {
           const nx = city.x + dx, ny = city.y + dy;
           if (state.map[ny]?.[nx] === WATER) {
+            claimedPickupCities.add(cityKey);
             missions.set(transport.id, {
               mission: {
                 type: 'transport_pickup',
                 target: { x: nx, y: ny },
-                pickupCity: `${city.x},${city.y}`,
+                pickupCity: cityKey,
                 priority: 6,
                 assignedBy: 'exploration',
                 reason: `pickup tanks at (${city.x},${city.y})`
@@ -1000,12 +979,77 @@ function assignTransportMissions(transports, state, knowledge, knownNeutral, kno
 // NAVAL EXPLORATION MISSIONS
 // ============================================================================
 
-function assignNavalExplorationMissions(navalUnits, state, knowledge, missions, turnLog) {
+/**
+ * Find the best unexplored water tile for a destroyer: prefer tiles that are
+ * far away AND surrounded by high unexplored density (deep frontier scouting).
+ * Unlike fighters, destroyers have null fuel so no return-trip constraint.
+ */
+function findDestroyerDeepTarget(unit, state, knowledge) {
+  const { width, height, map } = state;
+  let best = null, bestScore = -Infinity;
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (map[y][x] !== WATER) continue;
+      if (knowledge.exploredTiles.has(`${x},${y}`)) continue;
+
+      const dist = manhattanDistance(unit.x, unit.y, x, y);
+
+      // Count unexplored tiles in 5×5 neighbourhood — measures how much unknown
+      // territory this tile sits next to (high = edge of vast unknown)
+      let density = 0;
+      for (let dy2 = -2; dy2 <= 2; dy2++) {
+        for (let dx2 = -2; dx2 <= 2; dx2++) {
+          const nx = x + dx2, ny = y + dy2;
+          if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            if (!knowledge.exploredTiles.has(`${nx},${ny}`)) density++;
+          }
+        }
+      }
+
+      // Score: want far tiles with high unexplored density.
+      // density * 3 strongly rewards open-ocean frontier over crawling along
+      // an already-explored coastline.
+      const score = dist + density * 3;
+      if (score > bestScore) {
+        bestScore = score;
+        best = { x, y };
+      }
+    }
+  }
+  return best;
+}
+
+function assignNavalExplorationMissions(navalUnits, state, knowledge, missions, turnLog, useDeepScouting = false, phase = PHASE.LAND) {
+  // In LAND/TRANSITION, destroyers push outward into unexplored ocean — fighters and
+  // transports handle nearby island coastlines.  In NAVAL/LATE_GAME, coastline following
+  // is useful again (enemy contact established, island shape matters for routing).
+  const destroyerDeepFirst = useDeepScouting &&
+    (phase === PHASE.LAND || phase === PHASE.TRANSITION);
+
   // Check for partially-explored islands with unexplored coastlines
   const partialIslands = (knowledge.islands || []).filter(i => !i.fullyMapped && i.tiles.size > 0);
 
   for (const unit of navalUnits) {
-    // Priority 1: Follow coastline of partially-explored island
+    // Priority 1 (destroyers in LAND/TRANSITION): Deep frontier scouting first —
+    // explore beyond fighter range before worrying about nearby coastlines.
+    if (destroyerDeepFirst) {
+      const deepTarget = findDestroyerDeepTarget(unit, state, knowledge);
+      if (deepTarget) {
+        missions.set(unit.id, {
+          mission: {
+            type: 'explore_sector',
+            target: deepTarget,
+            priority: 6,
+            assignedBy: 'exploration',
+            reason: 'destroyer_deep_scout'
+          }
+        });
+        continue;
+      }
+    }
+
+    // Priority 1 (non-destroyer or NAVAL+): Follow coastline of partially-explored island
     if (partialIslands.length > 0) {
       let bestTarget = null, bestDist = Infinity;
       for (const island of partialIslands) {
@@ -1020,7 +1064,7 @@ function assignNavalExplorationMissions(navalUnits, state, knowledge, missions, 
           mission: {
             type: 'explore_island_coast',
             target: { x: bestTarget.x, y: bestTarget.y },
-            priority: 6,
+            priority: 5,
             assignedBy: 'exploration',
             reason: `coast explore island#${bestTarget.islandId}`
           }
@@ -1029,14 +1073,31 @@ function assignNavalExplorationMissions(navalUnits, state, knowledge, missions, 
       }
     }
 
-    // Priority 2: Explore open water
+    // Priority 2 (destroyers in NAVAL+): Deep frontier scouting after coast is done
+    if (useDeepScouting && !destroyerDeepFirst) {
+      const deepTarget = findDestroyerDeepTarget(unit, state, knowledge);
+      if (deepTarget) {
+        missions.set(unit.id, {
+          mission: {
+            type: 'explore_sector',
+            target: deepTarget,
+            priority: 4,
+            assignedBy: 'exploration',
+            reason: 'destroyer_deep_scout'
+          }
+        });
+        continue;
+      }
+    }
+
+    // Fallback: nearest unexplored water
     const waterTarget = findBestExploreTarget(unit, state, knowledge, 'water');
     if (waterTarget) {
       missions.set(unit.id, {
         mission: {
           type: 'explore_sector',
           target: waterTarget,
-          priority: 4,
+          priority: 3,
           assignedBy: 'exploration',
           reason: 'explore_water'
         }

@@ -88,9 +88,9 @@ export const TERRAIN_TYPES = {
     islandSizeMax: 2.5,         // Larger maximum island size
     islandAttempts: 300,        // More attempts for bigger landmasses
     growthProbability: 0.85,    // Very solid, continental islands
-    fillHoleRadius: 3,          // Aggressively fill interior holes
-    fillHoleThreshold: 2,       // Fill if 2+ cardinal neighbors are land
-    label: 'Dry (70% water) - Continental' 
+    fillHoleRadius: 2,          // Fill medium interior holes
+    fillHoleThreshold: 3,       // Fill if 3+ cardinal neighbors are land (prevents bridging channels)
+    label: 'Dry (70% water) - Large Islands'
   },
 };
 
@@ -152,6 +152,19 @@ function calculateEdgeSeparation(island1, island2) {
   }
   
   return minDist;
+}
+
+/**
+ * Check if a tile is 8-adjacent to any tile in a land set.
+ * O(1) — used to enforce minimum 1-tile water gap between island edges.
+ */
+function isAdjacentToLand(x, y, landSet) {
+  return (
+    landSet.has(`${x-1},${y}`)   || landSet.has(`${x+1},${y}`)   ||
+    landSet.has(`${x},${y-1}`)   || landSet.has(`${x},${y+1}`)   ||
+    landSet.has(`${x-1},${y-1}`) || landSet.has(`${x+1},${y-1}`) ||
+    landSet.has(`${x-1},${y+1}`) || landSet.has(`${x+1},${y+1}`)
+  );
 }
 
 /**
@@ -224,7 +237,9 @@ function generateNeutralIsland(startX, startY, targetSize, mapWidth, mapHeight, 
     const key = `${x},${y}`;
     
     if (existingLand.has(key)) continue;
-    
+    // Enforce 1-tile water gap between this island and all existing land
+    if (isAdjacentToLand(x, y, existingLand)) continue;
+
     const distToProtected = minDistanceToSet(x, y, protectedTiles);
     if (distToProtected >= bufferDistance) {
       island.add(key);
@@ -622,7 +637,9 @@ function generateMapAttempt(mapSize, terrain, difficulty) {
     const y = Math.floor(Math.random() * MAP_HEIGHT);
     
     if (allLand.has(`${x},${y}`)) continue;
-    
+    // Require seed at least 1 tile clear of all existing land
+    if (isAdjacentToLand(x, y, allLand)) continue;
+
     const distToProtected = minDistanceToSet(x, y, protectedTiles);
     if (distToProtected < BUFFER_DISTANCE) continue;
     
@@ -654,14 +671,20 @@ function generateMapAttempt(mapSize, terrain, difficulty) {
   
   for (const island of neutralIslands) {
     if (remainingNeutralCities <= 0) break;
-    
-    const canPlace = island.tiles.size >= 5;
-    if (canPlace) {
-      const cities = placeCitiesOnIsland(island, 1, allLand, MAP_WIDTH, MAP_HEIGHT);
-      if (cities.length > 0) {
-        neutralCityTiles.push(cities[0]);
-        remainingNeutralCities--;
-      }
+
+    if (island.tiles.size < 5) continue;
+    // Scale cities by island size: 1 city per 20 tiles (min 1, capped to remaining budget).
+    // Larger islands from dry-mode generation need proportionally more cities so the
+    // total city count reaches targetCities even with fewer, bigger islands.
+    const citiesForIsland = Math.min(
+      remainingNeutralCities,
+      Math.max(1, Math.floor(island.tiles.size / 20))
+    );
+    const cities = placeCitiesOnIsland(island, citiesForIsland, allLand, MAP_WIDTH, MAP_HEIGHT);
+    for (const c of cities) {
+      neutralCityTiles.push(c);
+      remainingNeutralCities--;
+      if (remainingNeutralCities <= 0) break;
     }
   }
   
@@ -792,7 +815,8 @@ export function generateMap(mapSize, terrain, difficulty) {
     result = generateMapAttempt(mapSize, terrain, difficulty);
     attempts++;
     
-    if (result.separationValid) {
+    const citiesValid = result.totalCities >= result.targetCities;
+    if (result.separationValid && citiesValid) {
       return {
         ...result,
         generationAttempts: attempts,
