@@ -32,11 +32,17 @@ export const logMission = (...args) => _debugAI    && console.log('[AI][MISSION]
 export const logAI    = (pfx, ...args) => _debugAI && console.log(`[AI][${pfx}]`, ...args);
 export const logObs   = (...args) => _debugObserver && console.log('[OBS]', ...args);
 
-// Consolidated turn summary logger
+// Consolidated turn summary logger — called before movement
 export function logTurnSummary(state, knowledge, missions, turnLog) {
   if (!_debugAI) return;
-  // Phase
-  console.log(`[AI][PHASE] ${knowledge.explorationPhase}`);
+
+  // Phase info line
+  const totalTiles = state.map.length * state.map[0].length;
+  const mapExplored = Math.round(knowledge.exploredTiles.size / totalTiles * 100);
+  const neutralCitiesKnown = Object.entries(state.cities)
+    .filter(([key, c]) => c.owner === 'neutral' && knowledge.exploredTiles.has(key)).length;
+  const islandsFound = (knowledge.islands || []).length;
+  console.log(`[AI][PHASE] check phase=${knowledge.explorationPhase}, mapExp=${mapExplored}%, NeutralCitiesKnown=${neutralCitiesKnown}, Islands found=${islandsFound}`);
 
   // Production summary (no coordinates)
   const aiCities = Object.values(state.cities).filter(c => c.owner === 'ai');
@@ -50,18 +56,43 @@ export function logTurnSummary(state, knowledge, missions, turnLog) {
   if (prodParts.length > 0) {
     console.log(`[AI][PROD] ${prodParts.join(', ')}`);
   }
+}
 
-  // Unit counts
+// Post-movement unit summary — called after executeStepByStepMovements
+// aiUnitsBefore: Map<id, type> snapshotted before movement
+export function logUnitSummary(state, aiUnitsBefore, turnLog) {
+  if (!_debugAI) return;
+
+  // Current unit counts
   const unitCounts = {};
   for (const type of Object.keys(UNIT_SPECS)) unitCounts[type] = 0;
   for (const u of state.units) {
     if (u.owner === 'ai') unitCounts[u.type]++;
   }
   const countStr = Object.entries(unitCounts)
-    .filter(([_, c]) => c > 0)
+    .filter(([, c]) => c > 0)
     .map(([t, c]) => `${t}: ${c}`)
     .join(', ');
   console.log(`[AI][UNITS] ${countStr}`);
+
+  // Crashed units (from turnLog)
+  const crashedTypes = (turnLog || [])
+    .filter(l => l.includes('crashed'))
+    .map(l => { const m = l.match(/^(\w+)\s+crashed/); return m ? m[1] : null; })
+    .filter(Boolean);
+  for (const type of crashedTypes) {
+    console.log(`[AI][UNITS] **${UNIT_SPECS[type]?.name || type} crashed with 0 fuel**`);
+  }
+
+  // Other lost units (not crashes)
+  const crashSet = new Set(crashedTypes);
+  const lostNonCrash = [...aiUnitsBefore.entries()]
+    .filter(([id]) => !state.units.some(u => u.id === id))
+    .map(([, type]) => type)
+    .filter(type => !crashSet.has(type));
+  for (const type of lostNonCrash) {
+    console.log(`[AI][UNITS] LOST: ${UNIT_SPECS[type]?.name || type}`);
+  }
 }
 
 // ============================================================================
@@ -88,7 +119,8 @@ export const AI_CONFIG = {
     navalMapThreshold: 0.40,
     lateNeutral: 0.10,
     lateCityControl: 0.60,
-    lateStrength: 2.0
+    lateStrength: 2.0,
+    lateMapExplored: 0.60   // minimum map exploration before LATE_GAME can trigger
   },
   fuel: { fighterReturn: 0.35, bomberReturn: 0.30 },
   defense: { garrisonPerCity: 1 },
@@ -106,7 +138,7 @@ export const AI_CONFIG = {
 
 // Unit allocation by phase: fraction given to tactical manager
 export const TACTICAL_ALLOCATION = {
-  [PHASE.LAND]: { fighter: 0, destroyer: 0, submarine: 0, battleship: 0, carrier: 0, bomber: 0 },
+  [PHASE.LAND]: { fighter: 0, destroyer: 0, submarine: 0, battleship: 1.0, carrier: 0, bomber: 0 },
   [PHASE.TRANSITION]: { fighter: 0, destroyer: 0, submarine: 0.6, battleship: 1.0, carrier: 0, bomber: 0 },
   [PHASE.NAVAL]: { fighter: 0.30, destroyer: 0.70, submarine: 1.0, battleship: 1.0, carrier: 0.70, bomber: 0.50 },
   [PHASE.LATE_GAME]: { fighter: 0.70, destroyer: 0.90, submarine: 1.0, battleship: 1.0, carrier: 0.90, bomber: 1.0 }

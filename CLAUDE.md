@@ -71,6 +71,15 @@ Combat is resolved in `strategic-conquest-game-integrated.jsx` (top of file). Ke
 - Battleships: range-2 bombardment, half-strength in direct combat
 - Carriers: half-strength in direct combat
 
+## Collaboration Workflow
+
+For incremental adjustments and subtle behavioral changes (as opposed to clear bugs or new features), Claude should **propose the approach and wait for approval before writing code**. This applies when:
+- The change affects AI decision-making or priority ordering
+- Multiple valid interpretations of the request exist
+- The fix requires restructuring existing logic rather than a targeted addition
+
+For clear bugs (crashes, wrong values, missing guards), implement directly. For everything else, describe the proposed change in plain terms first.
+
 ## Documentation
 
 Detailed architecture docs live in `src/SpecDocs/` covering modular architecture, AI manager design, module interfaces, combat rules, sprite integration, and UI component usage.

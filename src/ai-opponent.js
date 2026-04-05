@@ -14,15 +14,16 @@
 import {
   WATER, LAND, NEUTRAL_CITY, PLAYER_CITY, AI_CITY, UNIT_SPECS, ALL_DIRS,
   STATUS_READY, STATUS_GOTO, STATUS_USED, STATUS_SKIPPED, STATUS_ABOARD, STATUS_SENTRY,
-  manhattanDistance, CITY_COMBAT, BASE_HIT_CHANCE, NAVAL_VS_LAND_HIT_CHANCE
+  manhattanDistance, CITY_COMBAT, BASE_HIT_CHANCE, NAVAL_VS_LAND_HIT_CHANCE, BOMBARD_HIT_CHANCE
 } from './game-constants.js';
 // Movement engine not directly needed - managers use ai-helpers
 import { calculateVisibility } from './fog-of-war.js';
+import { recordCombatStats } from './game-state.js';
 
 // AI modules
 import {
   PHASE, AI_CONFIG, TARGET_DIST, TACTICAL_ALLOCATION,
-  log, logPhase, logMission, logTurnSummary, logObs,
+  log, logPhase, logMission, logTurnSummary, logUnitSummary, logObs,
   floodFillLand, getMoveToward, clearPathCache,
   evaluateCombat, getAdjacentEnemies,
   getAdjacentPlayerUnits, isAdjacentToPlayerCity,
@@ -267,7 +268,6 @@ function determinePhase(k, state) {
   const mapExplored = k.exploredTiles.size / totalTiles;
 
   // Debug: always log phase check values
-  logPhase(`Check: phase=${explorationPhase}, homeExp=${(homeExp*100).toFixed(1)}%, homeCitiesCaptured=${homeCitiesCaptured}, homeIslandTiles=${k.homeIslandTiles?.size || 'null'}, homeIslandCities=${k.homeIslandCities?.size || 0}, mapExp=${(mapExplored*100).toFixed(1)}%`);
 
   // LAND -> TRANSITION
   if (explorationPhase === PHASE.LAND) {
@@ -312,16 +312,20 @@ function determinePhase(k, state) {
     }
   }
 
-  // NAVAL -> LATE_GAME
+  // NAVAL -> LATE_GAME (requires minimum map exploration)
   if (explorationPhase === PHASE.NAVAL) {
     const neutralRatio = totalCities > 0 ? neutralCities / totalCities : 1;
     const aiControl = totalCities > 0 ? aiCities / totalCities : 0;
     const aiStr = aiUnits.reduce((s, u) => s + u.strength, 0);
     const pStr = playerUnits.reduce((s, u) => s + u.strength, 0);
 
-    if (neutralRatio < AI_CONFIG.exploration.lateNeutral) return PHASE.LATE_GAME;
-    if (aiControl >= AI_CONFIG.exploration.lateCityControl) return PHASE.LATE_GAME;
-    if (pStr > 0 && aiStr / pStr >= AI_CONFIG.exploration.lateStrength) return PHASE.LATE_GAME;
+    if (mapExplored >= AI_CONFIG.exploration.lateMapExplored) {
+      if (neutralRatio < AI_CONFIG.exploration.lateNeutral) return PHASE.LATE_GAME;
+      if (aiControl >= AI_CONFIG.exploration.lateCityControl) return PHASE.LATE_GAME;
+      if (pStr > 0 && aiStr / pStr >= AI_CONFIG.exploration.lateStrength) return PHASE.LATE_GAME;
+    } else {
+      logPhase(`LATE_GAME blocked: map only ${(mapExplored*100).toFixed(1)}% explored (need ${(AI_CONFIG.exploration.lateMapExplored*100).toFixed(0)}%)`);
+    }
   }
 
   return explorationPhase;
@@ -399,6 +403,7 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions, observe
   };
   const observations = [];
   const combatEvents = [];  // Track detailed combat results for player report
+  const contactEvents = [];  // Track first AI contact with player territory
   let threats = detectThreats(s, k);
 
   // Observer mode: track every tile visited per unit
@@ -530,6 +535,16 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions, observe
         continue;
       }
 
+      if (decision.action === 'bombard') {
+        const t = decision.target;
+        turnLog.push(`${unit.type}@${unit.x},${unit.y} bombards ${t.enemy.type}@${t.x},${t.y}`);
+        const result = handleAIBombardment(s, unitIdx, t, turnLog);
+        s = result.state;
+        if (result.combatEvent) combatEvents.push(result.combatEvent);
+        updateObservation(observationState, unit.id, t.x, t.y, true);
+        continue;
+      }
+
       if (decision.action === 'move_toward') {
         // Transports avoid known enemy naval positions — compute danger zone tiles once
         // per move decision and pass as tile cost hints to the pathfinder.
@@ -539,6 +554,18 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions, observe
           if (observerMode) logObs(`    #${unit.id} ${unit.type}@(${unit.x},${unit.y})→(${moveTarget.x},${moveTarget.y}) [${decision.reason}] moves=${unit.movesLeft - 1}${unit.fuel != null ? ` fuel=${unit.fuel - 1}` : ''}`);
           s = executeMove(s, unitIdx, moveTarget, unit, turnLog, observationState, missions.get(unit.id)?.mission);
           trackPos(unit.id);
+          // Post-move unload: if this transport just used its last move and is now
+          // adjacent to a capturable city, assault immediately rather than waiting a turn.
+          if (UNIT_SPECS[unit.type]?.carriesTanks) {
+            const postIdx = s.units.findIndex(u => u.id === unit.id);
+            if (postIdx >= 0 && s.units[postIdx].movesLeft === 0) {
+              const postCargo = s.units.filter(cu => cu.aboardId === unit.id);
+              if (postCargo.length > 0) {
+                const postUnload = tryTransportUnload(s, postIdx, turnLog, missions);
+                if (postUnload.unloaded) s = postUnload.state;
+              }
+            }
+          }
         } else {
           // getMoveToward returned null: the assigned target is unreachable (e.g. explore
           // target just became explored by this unit's own vision, or target is on a
@@ -615,7 +642,7 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions, observe
       if (s.cities[key] && !k.knownCities.has(key)) {
         k.knownCities.add(key);
         const discoveredCity = s.cities[key];
-        log(`Discovered city at ${key} (owner: ${discoveredCity.owner})`);
+        log(`Discovered ${discoveredCity.owner} city`);
         // Mid-turn event: capturable city discovered → redirect nearest eligible tank
         if (discoveredCity.owner === 'neutral' || discoveredCity.owner === 'player') {
           const [cx, cy] = key.split(',').map(Number);
@@ -632,13 +659,22 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions, observe
     // Update threats
     threats = detectThreats(s, k);
 
-    // Contact check
+    // Contact check — record first-time discoveries for the player summary
     for (const key of newVis) {
       const [x, y] = key.split(',').map(Number);
-      if (s.units.find(u => u.x === x && u.y === y && u.owner === 'player' && !u.aboardId)) {
+      const playerUnit = s.units.find(u => u.x === x && u.y === y && u.owner === 'player' && !u.aboardId);
+      if (playerUnit) {
+        if (!k.hasSeenPlayerUnit) {
+          contactEvents.push({ type: 'found_unit', x, y, unitType: playerUnit.type });
+        }
         k.hasSeenPlayerUnit = true;
       }
-      if (s.cities[key]?.owner === 'player') k.hasSeenPlayerCity = true;
+      if (s.cities[key]?.owner === 'player') {
+        if (!k.hasSeenPlayerCity) {
+          contactEvents.push({ type: 'found_city', x, y });
+        }
+        k.hasSeenPlayerCity = true;
+      }
     }
   }
 
@@ -664,7 +700,7 @@ function executeStepByStepMovements(state, knowledge, turnLog, missions, observe
     }
   }
 
-  return { state: s, knowledge: k, observations, combatEvents, observerPositionLog };
+  return { state: s, knowledge: k, observations, combatEvents, contactEvents, observerPositionLog };
 }
 
 // ============================================================================
@@ -714,14 +750,25 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
     }
 
     if (!inAICity && unit.strength < retreatThreshold) {
-      // Below 50% and not in a city — retreat to nearest AI city
-      const repairTarget = aiCities.reduce((best, c) => {
-        const d = manhattanDistance(unit.x, unit.y, c.x, c.y);
-        return (!best || d < best.d) ? { x: c.x, y: c.y, d } : best;
-      }, null);
-      if (repairTarget) {
-        log(`[REPAIR] ${spec.name}#${unit.id} at ${unit.strength}/${spec.strength} hp retreating to (${repairTarget.x},${repairTarget.y})`);
-        return { action: 'move_toward', target: repairTarget, reason: 'repair_retreat' };
+      // Below 50% and not in a city — retreat unless friendly fleet locally dominates
+      const nearbyFriendlyStr = state.units
+        .filter(u => u.owner === 'ai' && !u.aboardId && UNIT_SPECS[u.type]?.isNaval &&
+                     manhattanDistance(u.x, u.y, unit.x, unit.y) <= 4)
+        .reduce((sum, u) => sum + u.strength, 0);
+      const nearbyEnemyStr = state.units
+        .filter(u => u.owner === 'player' && !u.aboardId &&
+                     manhattanDistance(u.x, u.y, unit.x, unit.y) <= 4)
+        .reduce((sum, u) => sum + u.strength, 0);
+      const friendlyDominates = nearbyEnemyStr === 0 || nearbyFriendlyStr >= nearbyEnemyStr * 1.5;
+      if (!friendlyDominates) {
+        const repairTarget = aiCities.reduce((best, c) => {
+          const d = manhattanDistance(unit.x, unit.y, c.x, c.y);
+          return (!best || d < best.d) ? { x: c.x, y: c.y, d } : best;
+        }, null);
+        if (repairTarget) {
+          log(`[REPAIR] ${spec.name}#${unit.id} at ${unit.strength}/${spec.strength} hp retreating to (${repairTarget.x},${repairTarget.y})`);
+          return { action: 'move_toward', target: repairTarget, reason: 'repair_retreat' };
+        }
       }
     }
   }
@@ -732,6 +779,32 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
     const evaluation = evaluateCombat(unit, enemy, state);
     if (evaluation.shouldAttack) {
       return { action: 'attack', target: { x, y, enemy }, reason: evaluation.reason };
+    }
+  }
+
+  // ===== BOMBARD OPPORTUNITY (range-2, Chebyshev) =====
+  // Battleships can bombard before/after moving — check for high-value targets at exactly range 2.
+  if (spec.canBombard && !unit.hasBombarded) {
+    let bestTarget = null, bestValue = -1;
+    for (let dx = -2; dx <= 2; dx++) {
+      for (let dy = -2; dy <= 2; dy++) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== 2) continue; // Chebyshev == 2
+        const bx = unit.x + dx, by = unit.y + dy;
+        if (bx < 0 || bx >= state.width || by < 0 || by >= state.height) continue;
+        const enemiesAt = state.units.filter(u => u.x === bx && u.y === by && u.owner !== unit.owner && !u.aboardId);
+        for (const enemy of enemiesAt) {
+          const eSpec = UNIT_SPECS[enemy.type];
+          if (!eSpec) continue;
+          const val = (eSpec.productionDays || 0) +
+            state.units.filter(cu => cu.aboardId === enemy.id)
+              .reduce((sum, cu) => sum + (UNIT_SPECS[cu.type]?.productionDays || 0), 0);
+          if (val > bestValue) { bestValue = val; bestTarget = { x: bx, y: by, enemy }; }
+        }
+      }
+    }
+    if (bestTarget) {
+      log(`[BOMBARD] ${spec.name}#${unit.id} at (${unit.x},${unit.y}) bombarding ${bestTarget.enemy.type} at (${bestTarget.x},${bestTarget.y}) value=${bestValue}`);
+      return { action: 'bombard', target: bestTarget, reason: 'bombard_opportunity' };
     }
   }
 
@@ -849,6 +922,11 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
 
   // ===== FOLLOW ASSIGNED MISSION =====
   const assignment = missions.get(unit.id);
+  // Explicit wait mission: must be checked before the target branch so a
+  // wait-type mission doesn't fall through to default naval/land exploration.
+  if (assignment?.mission?.type === 'wait') {
+    return { action: 'wait', reason: assignment.mission.reason || 'assigned_wait' };
+  }
   if (assignment?.mission?.target) {
     const m = assignment.mission;
 
@@ -910,6 +988,15 @@ function decideNextStep(unit, state, knowledge, threats, missions) {
   }
 
   // ===== NO MISSION - DEFAULT BEHAVIOR =====
+
+  // Bombers with no mission (no player cities known yet): return to nearest AI city
+  if (unit.type === 'bomber') {
+    if (_nearestRefuel) {
+      const distToBase = Math.max(Math.abs(unit.x - _nearestRefuel.x), Math.abs(unit.y - _nearestRefuel.y));
+      if (distToBase > 0) return { action: 'move_toward', target: _nearestRefuel, reason: 'bomber_hold_at_base' };
+    }
+    return { action: 'wait', reason: 'bomber_at_base' };
+  }
 
   // Fighters with no mission: find nearest unexplored, per-step fuel check
   if (unit.type === 'fighter') {
@@ -973,11 +1060,16 @@ function executeMove(state, unitIdx, moveTarget, unit, turnLog, observationState
   let s = { ...state, units: [...state.units] };
   const spec = UNIT_SPECS[unit.type];
 
+  const dx = moveTarget.x - unit.x;
+  const movedToNewTile = dx !== 0 || moveTarget.y !== unit.y;
+  const newFacing = dx < 0 ? 'W' : dx > 0 ? 'E' : (s.units[unitIdx].facing || 'E');
   s.units[unitIdx] = {
     ...s.units[unitIdx],
     x: moveTarget.x,
     y: moveTarget.y,
-    movesLeft: s.units[unitIdx].movesLeft - 1
+    movesLeft: s.units[unitIdx].movesLeft - 1,
+    facing: newFacing,
+    ...(spec.stealth && movedToNewTile ? { revealed: false } : {})
   };
 
   // Fuel consumption
@@ -1017,12 +1109,13 @@ function updateObservation(observationState, unitId, x, y, forcedObserved, state
     const aiUnit = state.units.find(u => u.id === unitId);
     const aiSpec = aiUnit ? UNIT_SPECS[aiUnit.type] : null;
     const allObs = getAdjacentPlayerUnits(x, y, state.units);
-    // Stealthy AI units (subs) can only be spotted by player units with detectsSubs
-    const obs = aiSpec?.stealth
+    // Stealthy AI units (subs) can only be spotted by player units with detectsSubs, unless revealed
+    const isHiddenSub = aiSpec?.stealth && !aiUnit?.revealed;
+    const obs = isHiddenSub
       ? allObs.filter(pu => UNIT_SPECS[pu.type]?.detectsSubs)
       : allObs;
-    // Cities also can't detect submerged submarines
-    const nearCity = !aiSpec?.stealth && isAdjacentToPlayerCity(x, y, state.cities);
+    // Cities also can't detect submerged submarines (but can spot revealed ones)
+    const nearCity = !isHiddenSub && isAdjacentToPlayerCity(x, y, state.cities);
     if (obs.length > 0 || nearCity) {
       obsState.wasObserved = true;
       obsState.observers.push(...obs);
@@ -1090,8 +1183,8 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
     ? Math.max(1, Math.ceil(target.strength * 0.5))
     : Math.max(0, Math.round((defSpec.defenseRolls || 1) * dRatio));
 
-  // Submarine stealth: defender can't shoot back unless it has sub-detection
-  if (attSpec.stealth && !defSpec.detectsSubs) defRolls = 0;
+  // Submarine stealth: defender can't shoot back unless it has sub-detection (or sub is already revealed)
+  if (attSpec.stealth && !defSpec.detectsSubs && !unit.revealed) defRolls = 0;
 
   // Naval vs land: both sides hit less often (sea-to-shore difficulty)
   const aHit = (attSpec.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
@@ -1124,6 +1217,10 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
     }
   };
 
+  // Record combat stats before filtering dead units
+  { const sr = recordCombatStats(s.units, s.destroyedUnits || [], unit.id, target.id, attackerStartStrength, defenderStartStrength, attRem, defRem, s.turn);
+    s.units = sr.units; s.destroyedUnits = sr.destroyedUnits; }
+
   const defIdx = s.units.findIndex(x => x.id === target.id);
   if (defRem <= 0) {
     // Remove the destroyed unit and any cargo it was carrying
@@ -1139,27 +1236,84 @@ function handleCombat(state, unitIdx, next, target, turnLog) {
   } else {
     const newIdx = s.units.findIndex(x => x.id === unit.id);
     if (newIdx >= 0) {
-      // Multi-attack rule (mirrors player logic):
-      // First attack on a fresh unit costs 1 move; any subsequent attack exhausts all moves.
-      const hasAlreadyActed = unit.movesLeft < attSpec.movement;
-      const newMovesLeft = (!hasAlreadyActed && unit.movesLeft > 1) ? unit.movesLeft - 1 : 0;
+      // Multi-attack rule: each attack costs 1 move; the second attack exhausts all remaining moves.
+      // Uses hasAttacked flag (not movesLeft comparison) so movement before attacking doesn't penalize.
+      const newMovesLeft = (!unit.hasAttacked && unit.movesLeft > 1) ? unit.movesLeft - 1 : 0;
       const newStatus = newMovesLeft === 0 ? STATUS_USED : unit.status;
-      s.units[newIdx] = { ...s.units[newIdx], strength: attRem, movesLeft: newMovesLeft, gotoPath: null, status: newStatus };
+      // Sub reveals itself when firing torpedoes
+      const subRevealed = attSpec.stealth ? true : (s.units[newIdx].revealed || false);
+      s.units[newIdx] = { ...s.units[newIdx], strength: attRem, movesLeft: newMovesLeft, hasAttacked: true, gotoPath: null, status: newStatus, revealed: subRevealed };
       if (defRem <= 0) {
         const remaining = s.units.filter(eu => eu.x === next.x && eu.y === next.y && eu.owner !== 'ai' && !eu.aboardId);
         if (remaining.length === 0) {
-          // Naval units cannot advance onto land tiles (cities owned by AI are ok)
+          // Naval units cannot advance onto land; land units cannot advance onto water
           const targetTile = s.map[next.y]?.[next.x];
-          const canAdvance = !attSpec.isNaval || targetTile === WATER
-            || (s.cities[`${next.x},${next.y}`]?.owner === 'ai');
+          const canAdvance = attSpec.isNaval
+            ? (targetTile === WATER || s.cities[`${next.x},${next.y}`]?.owner === 'ai')
+            : (targetTile !== WATER);
           if (canAdvance) {
-            s.units[newIdx] = { ...s.units[newIdx], x: next.x, y: next.y };
+            // Sub advances to new tile — concealed again
+            s.units[newIdx] = { ...s.units[newIdx], x: next.x, y: next.y, revealed: false };
           }
         }
       }
     }
     return { state: s, attackerDestroyed: false, combatEvent };
   }
+}
+
+// ============================================================================
+// AI BOMBARDMENT
+// ============================================================================
+
+/**
+ * AI unit performs range-2 bombardment against an enemy unit.
+ * No counterattack — defender takes damage, attacker keeps full strength.
+ * Costs 1 move and sets hasBombarded=true, same as player bombardment rules.
+ */
+function handleAIBombardment(state, unitIdx, target, turnLog) {
+  let s = { ...state, units: [...state.units], cities: { ...state.cities }, map: state.map.map(r => [...r]) };
+  const unit = s.units[unitIdx];
+  const spec = UNIT_SPECS[unit.type];
+  const defUnit = target.enemy;
+  const defSpec = UNIT_SPECS[defUnit.type];
+
+  const aRolls = Math.max(1, Math.ceil(unit.strength * 0.5));
+  let dmgToDef = 0;
+  for (let i = 0; i < aRolls; i++) {
+    if (Math.random() < BOMBARD_HIT_CHANCE) dmgToDef += (spec.damagePerHit || 1);
+  }
+  const defRem = Math.max(0, defUnit.strength - dmgToDef);
+  const defDead = defRem <= 0;
+
+  turnLog.push(`BOMBARD: ${unit.type}@${unit.x},${unit.y} fires at ${defUnit.type}@${target.x},${target.y} → ${dmgToDef} dmg, defRem=${defRem}`);
+
+  // Record combat stats (no attacker damage — atkStrAfter = atkStrBefore)
+  { const sr = recordCombatStats(s.units, s.destroyedUnits || [], unit.id, defUnit.id, unit.strength, defUnit.strength, unit.strength, defRem, s.turn);
+    s.units = sr.units; s.destroyedUnits = sr.destroyedUnits; }
+
+  if (defDead) {
+    s.units = s.units.filter(u => u.id !== defUnit.id && u.aboardId !== defUnit.id);
+  } else {
+    const defIdx = s.units.findIndex(u => u.id === defUnit.id);
+    if (defIdx >= 0) s.units[defIdx] = { ...s.units[defIdx], strength: defRem };
+  }
+
+  const newIdx = s.units.findIndex(u => u.id === unit.id);
+  if (newIdx >= 0) {
+    const newMovesLeft = Math.max(0, s.units[newIdx].movesLeft - 1);
+    s.units[newIdx] = { ...s.units[newIdx], movesLeft: newMovesLeft, hasBombarded: true,
+      status: newMovesLeft === 0 ? STATUS_USED : s.units[newIdx].status };
+  }
+
+  const combatEvent = {
+    location: { x: target.x, y: target.y },
+    isBombardment: true,
+    attacker: { type: unit.type, owner: unit.owner, startStrength: unit.strength, endStrength: unit.strength, destroyed: false },
+    defender: { type: defUnit.type, owner: defUnit.owner, startStrength: defUnit.strength, endStrength: defRem, destroyed: defDead }
+  };
+
+  return { state: s, combatEvent };
 }
 
 // ============================================================================
@@ -1184,6 +1338,8 @@ function tryTransportUnload(state, unitIdx, turnLog, missions) {
   if (cargo.length === 0) return { state: s, unloaded: false };
 
   // Check all adjacent tiles for capturable cities
+  let adjacentCapturableCity = null; // Track defended cities for fallback land drop
+
   for (const [dx, dy] of ALL_DIRS) {
     const adjX = unit.x + dx, adjY = unit.y + dy;
     if (adjX < 0 || adjX >= s.map[0].length || adjY < 0 || adjY >= s.map.length) continue;
@@ -1198,9 +1354,12 @@ function tryTransportUnload(state, unitIdx, turnLog, missions) {
 
     if (!isCapturable) continue;
 
-    // Found a capturable city adjacent to transport!
+    // Remember this city as a land-drop target even if it's defended
+    if (!adjacentCapturableCity) adjacentCapturableCity = { x: adjX, y: adjY };
+
+    // Only directly assault undefended cities — defended ones get a land drop below
     const defenders = s.units.filter(d => d.x === adjX && d.y === adjY && d.owner === 'player' && !d.aboardId);
-    if (defenders.length > 0) continue; // Can't unload into defended city
+    if (defenders.length > 0) continue;
 
     // Use the first tank to assault the city — goes through city combat like a regular capture
     const assaultTank = cargo[0];
@@ -1229,6 +1388,32 @@ function tryTransportUnload(state, unitIdx, turnLog, missions) {
     // Remaining tanks stay aboard — transport will seek the next city next turn
 
     return { state: s, unloaded: true };
+  }
+
+  // Adjacent capturable city found but it was defended — land a tank on the nearest
+  // non-enemy land tile adjacent to the transport, aimed toward that city.
+  // This lets the tank march overland to threaten the city rather than doing nothing.
+  if (adjacentCapturableCity) {
+    const { x: cityX, y: cityY } = adjacentCapturableCity;
+    let bestLand = null, bestDist = Infinity;
+    for (const [dx, dy] of ALL_DIRS) {
+      const adjX = unit.x + dx, adjY = unit.y + dy;
+      if (adjX < 0 || adjX >= s.map[0].length || adjY < 0 || adjY >= s.map.length) continue;
+      if (s.map[adjY][adjX] === WATER) continue;
+      const blockers = s.units.filter(u => u.x === adjX && u.y === adjY && u.owner === 'player' && !u.aboardId);
+      if (blockers.length > 0) continue;
+      const dist = manhattanDistance(adjX, adjY, cityX, cityY);
+      if (dist < bestDist) { bestDist = dist; bestLand = { x: adjX, y: adjY }; }
+    }
+    if (bestLand) {
+      const tank = cargo[0];
+      const tankIdx = s.units.findIndex(x => x.id === tank.id);
+      if (tankIdx >= 0) {
+        s.units[tankIdx] = { ...s.units[tankIdx], aboardId: null, x: bestLand.x, y: bestLand.y, status: STATUS_READY, movesLeft: 0 };
+        turnLog.push(`Transport landing tank#${tank.id} at (${bestLand.x},${bestLand.y}) -> march to defended city (${cityX},${cityY})`);
+      }
+      return { state: s, unloaded: true };
+    }
   }
 
   // No capturable city adjacent - check if transport has arrived at its mission target
@@ -1346,6 +1531,8 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
   clearPathCache();
 
   let state = { ...gameState, units: [...gameState.units], cities: { ...gameState.cities }, map: gameState.map.map(r => [...r]) };
+  // Snapshot contact state BEFORE this turn's updates — used for declaration of war
+  const hadContactBeforeTurn = knowledge.hasSeenPlayerUnit || knowledge.hasSeenPlayerCity;
   let k = updateAIKnowledge(knowledge, state);
   const turnLog = [];
 
@@ -1378,7 +1565,7 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
       movement = Math.max(1, movement - 1);
       log(`[DAMAGE] ${spec.name}#${u.id} at ${u.strength}/${spec.strength} str Ã¢â€ â€™ ${movement} moves (reduced)`);
     }
-    const unit = { ...u, movesLeft: movement };
+    const unit = { ...u, movesLeft: movement, hasAttacked: false };
     if (unit.status === STATUS_USED || unit.status === STATUS_SKIPPED) unit.status = STATUS_READY;
     const city = state.cities[`${unit.x},${unit.y}`];
     if (city?.owner === 'ai' && !unit.aboardId) {
@@ -1409,15 +1596,25 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
   logTurnSummary(state, k, allMissions, turnLog);
 
   // === EXECUTE MOVEMENTS ===
+  const aiUnitsBefore = new Map(state.units.filter(u => u.owner === 'ai').map(u => [u.id, u.type]));
   const moveResult = executeStepByStepMovements(state, k, turnLog, allMissions);
   state = moveResult.state;
   k = moveResult.knowledge;
   const observations = moveResult.observations;
   const combatEvents = moveResult.combatEvents || [];
+  const contactEvents = moveResult.contactEvents || [];
+  logUnitSummary(state, aiUnitsBefore, turnLog);
 
   // === Final knowledge update & phase check ===
-  const contactBefore = k.hasSeenPlayerUnit || k.hasSeenPlayerCity;
+  // Also catch contact that becomes visible from static unit positions after movement ends
+  const hadSeenUnit = k.hasSeenPlayerUnit;
+  const hadSeenCity = k.hasSeenPlayerCity;
+  const contactBefore = hadSeenUnit || hadSeenCity;
   k = updateAIKnowledge(k, state);
+  // Record static-visibility contact events (not already captured during movement)
+  if (!hadSeenUnit && k.hasSeenPlayerUnit) contactEvents.push({ type: 'found_unit', x: null, y: null, unitType: null });
+  if (!hadSeenCity && k.hasSeenPlayerCity) contactEvents.push({ type: 'found_city', x: null, y: null });
+
   const contactAfter = k.hasSeenPlayerUnit || k.hasSeenPlayerCity;
 
   if (!contactBefore && contactAfter) {
@@ -1429,14 +1626,19 @@ export function executeAITurn(gameState, knowledge, unused, playerMadeContact = 
     }
   }
 
+  // Add phase change to contact events so the player sees it in the summary
+  if (oldPhase !== k.explorationPhase) {
+    contactEvents.push({ type: 'phase_change', from: oldPhase, to: k.explorationPhase });
+  }
+
   // Persist transport missions into knowledge so next turn can avoid redundant reassignment
   k.activeMissions = {};
   for (const [id, entry] of allMissions) {
     if (entry?.mission) k.activeMissions[id] = entry.mission;
   }
 
-  // Exploration delta
-  return { state, knowledge: k, log: turnLog, observations, combatEvents };
+  const declarationOfWar = !hadContactBeforeTurn && (k.hasSeenPlayerUnit || k.hasSeenPlayerCity);
+  return { state, knowledge: k, log: turnLog, observations, combatEvents, contactEvents, declarationOfWar };
 }
 
 // ============================================================================

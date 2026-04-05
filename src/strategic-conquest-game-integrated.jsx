@@ -12,13 +12,13 @@ import {
 } from './game-constants.js';
 import { calculateVisibility, buildFogArray, updateExploredTiles } from './fog-of-war.js';
 import { getValidMoves, findPath, getUnitLocation, getCargoCount, isOnRefuelTile, getBombardTargets } from './movement-engine.js';
-import { createGameState, setUnitGoTo, setUnitPatrol, setUnitStatus, unloadUnit, setCityProduction, endPlayerTurn, checkVictoryCondition, findNextUnit } from './game-state.js';
+import { createGameState, setUnitGoTo, setUnitPatrol, setUnitStatus, unloadUnit, setCityProduction, endPlayerTurn, checkVictoryCondition, findNextUnit, recordCombatStats } from './game-state.js';
 import { executeAITurn, createAIKnowledge, createAIKnowledgeFromState, recordPlayerObservations } from './ai-opponent.js';
 import { setAILogging } from './ai-helpers.js';
 import { createObserverKnowledge, executeObserverTurn } from './ai-observer.js';
 import { generateMap, MAP_SIZES, TERRAIN_TYPES, DIFFICULTY_LEVELS } from './map-generator.js';
 import { Tile, UnitSprite, MiniMap, TurnInfo, UnitInfoPanel, CommandMenu, GotoLineOverlay, PatrolOverlay } from './ui-components.jsx';
-import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, HelpDialog, getSavedGames, getAutoSave, saveAutoSave, buildSaveData } from './dialog-components.jsx';
+import { CityProductionDialog, UnitViewDialog, CityListDialog, AllUnitsListDialog, PatrolConfirmDialog, VictoryDialog, DefeatDialog, AITurnSummaryDialog, SurrenderDialog, SaveGameDialog, LoadGameDialog, HelpDialog, CombatTrackerDialog, getSavedGames, getAutoSave, saveAutoSave, buildSaveData } from './dialog-components.jsx';
 
 // ============================================================================
 // LEADERBOARD
@@ -66,7 +66,7 @@ function simulateCombat(attacker, defSpec, defStr, allUnits = []) {
     }
   }
 
-  if (att.stealth && !defSpec.detectsSubs) dRolls = 0;
+  if (att.stealth && !defSpec.detectsSubs && !attacker.revealed) dRolls = 0;
   const aHit = (att.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE, dHit = (defSpec.isLand && att.isNaval) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
   let dmgToDef = 0, dmgToAtt = 0;
   for (let i = 0; i < aRolls; i++) if (Math.random() < aHit) dmgToDef += att.damagePerHit;
@@ -106,12 +106,17 @@ function simulateCombatWithDefender(attacker, defender, allUnits = []) {
     if (bonusDice > 0) dRolls += bonusDice;
   }
   
-  if (att.stealth && !defSpec.detectsSubs) dRolls = 0;
+  if (att.stealth && !defSpec.detectsSubs && !attacker.revealed) dRolls = 0;
+  // Sub ambush: when a non-detector moves into a submarine, the sub deals full
+  // attack damage (4x) rather than its normal defensive damage — the attacker
+  // has no idea it's there until it's too late.
+  const subAmbush = defSpec.stealth && att.isNaval && !att.detectsSubs;
+  const defDmgPerHit = subAmbush ? defSpec.damagePerHit : defSpec.defenseDamagePerHit;
   const aHit = (att.isNaval && defSpec.isLand) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
   const dHit = (defSpec.isLand && att.isNaval) ? NAVAL_VS_LAND_HIT_CHANCE : BASE_HIT_CHANCE;
   let dmgToDef = 0, dmgToAtt = 0;
   for (let i = 0; i < aRolls; i++) if (Math.random() < aHit) dmgToDef += att.damagePerHit;
-  for (let i = 0; i < dRolls; i++) if (Math.random() < dHit) dmgToAtt += defSpec.defenseDamagePerHit;
+  for (let i = 0; i < dRolls; i++) if (Math.random() < dHit) dmgToAtt += defDmgPerHit;
   return { dmgToDef, dmgToAtt, attRem: Math.max(0, aStr - dmgToAtt), defRem: Math.max(0, defStr - dmgToDef) };
 }
 
@@ -226,6 +231,7 @@ export default function StrategicConquestGame() {
   const [mouseTile, setMouseTile] = useState(null);
   const [showCityDialog, setShowCityDialog] = useState(null), [showUnitView, setShowUnitView] = useState(null);
   const [showCityList, setShowCityList] = useState(false), [showAllUnits, setShowAllUnits] = useState(false), [showPatrolConfirm, setShowPatrolConfirm] = useState(false);
+  const [showCombatTracker, setShowCombatTracker] = useState(false);
   
   // BUG #6 FIX: Track captured city to show dialog after state update
   const [capturedCityKey, setCapturedCityKey] = useState(null);
@@ -237,6 +243,8 @@ export default function StrategicConquestGame() {
   // BUG #2 FIX: State for AI turn observations
   const [aiObservations, setAiObservations] = useState([]);
   const [aiCombatEvents, setAiCombatEvents] = useState([]);
+  const [aiContactEvents, setAiContactEvents] = useState([]);
+  const [aiDeclarationOfWar, setAiDeclarationOfWar] = useState(false);
   const [showAiSummary, setShowAiSummary] = useState(false);
   
   // BUG #2 FIX: Track if player made contact with AI this turn (for AI phase transition)
@@ -480,7 +488,8 @@ export default function StrategicConquestGame() {
     const newUnits = state.units.map(u => {
       if (u.id !== unitId) return u;
 
-      const updated = { ...u, x: targetX, y: targetY, movesLeft: u.movesLeft - 1 };
+      const newFacing = targetX < u.x ? 'W' : targetX > u.x ? 'E' : (u.facing || 'E');
+      const updated = { ...u, x: targetX, y: targetY, movesLeft: u.movesLeft - 1, facing: newFacing };
 
       // If launching from a carrier/transport, clear aboardId so subsequent steps
       // use the unit's own position rather than the carrier's position
@@ -800,20 +809,24 @@ export default function StrategicConquestGame() {
     
     setGameState(prev => {
       let newUnits = [...prev.units];
+      let newDestroyedUnits = [...(prev.destroyedUnits || [])];
       const unitIdx = newUnits.findIndex(u => u.id === activeUnit.id);
-      
+
       if (target.hasEnemy && target.enemyUnit) {
-        // Resolve bombardment against enemy
+        // Resolve bombardment against enemy (no counterattack — atkStrAfter = atkStrBefore)
         const result = resolveBombardment(activeUnit, target.enemyUnit);
-        
+        const statsResult = recordCombatStats(newUnits, newDestroyedUnits, activeUnit.id, target.enemyUnit.id, activeUnit.strength, target.enemyUnit.strength, activeUnit.strength, result.defRem, prev.turn);
+        newUnits = statsResult.units;
+        newDestroyedUnits = statsResult.destroyedUnits;
+
         if (result.defDead) {
           // Enemy destroyed
-          newUnits = newUnits.filter(u => u.id !== target.enemyUnit.id);
+          newUnits = newUnits.filter(u => u.id !== target.enemyUnit.id && u.aboardId !== target.enemyUnit.id);
           setMessage(`Bombardment hit! Enemy ${UNIT_SPECS[target.enemyUnit.type].name} destroyed!`);
         } else if (result.hits > 0) {
           // Enemy damaged
           const defIdx = newUnits.findIndex(u => u.id === target.enemyUnit.id);
-          newUnits[defIdx] = { ...newUnits[defIdx], strength: result.defRem };
+          if (defIdx >= 0) newUnits[defIdx] = { ...newUnits[defIdx], strength: result.defRem };
           setMessage(`Bombardment hit! Enemy ${UNIT_SPECS[target.enemyUnit.type].name} damaged (${result.defRem} remaining).`);
         } else {
           // Missed
@@ -824,24 +837,24 @@ export default function StrategicConquestGame() {
         const rolls = Math.max(1, Math.ceil(activeUnit.strength * 0.5));
         setMessage(`Bombardment fired at empty square. (${rolls} shots)`);
       }
-      
+
       // BOMBARD FIX: Consume 1 move and set hasBombarded flag
       const newMovesLeft = Math.max(0, newUnits[unitIdx].movesLeft - 1);
-      newUnits[unitIdx] = { 
-        ...newUnits[unitIdx], 
+      newUnits[unitIdx] = {
+        ...newUnits[unitIdx],
         movesLeft: newMovesLeft,
         hasBombarded: true,  // Track that unit has bombarded
         status: newMovesLeft === 0 ? STATUS_USED : newUnits[unitIdx].status
       };
-      
+
       // Exit bombard mode
       setBombardMode(false);
-      
+
       // BOMBARD FIX: If unit still has moves, stay on this unit; otherwise advance
       if (newMovesLeft > 0) {
-        return { ...prev, units: newUnits };
+        return { ...prev, units: newUnits, destroyedUnits: newDestroyedUnits };
       } else {
-        return advanceToNextUnit({ ...prev, units: newUnits }, true);
+        return advanceToNextUnit({ ...prev, units: newUnits, destroyedUnits: newDestroyedUnits }, true);
       }
     });
   }, [activeUnit, gameState, bombardMode, bombardTargets, advanceToNextUnit]);
@@ -858,6 +871,7 @@ export default function StrategicConquestGame() {
       let newUnits = prev.units.map(u => ({ ...u })); // Deep copy all units
       let newCities = { ...prev.cities };
       let newMap = prev.map.map(row => [...row]);
+      let newDestroyedUnits = [...(prev.destroyedUnits || [])];
       
       // Find our unit in the copied array
       const unitIdx = newUnits.findIndex(u => u.id === activeUnit.id);
@@ -984,17 +998,17 @@ export default function StrategicConquestGame() {
             setMessage('City captured! Tank becomes garrison.'); 
             capturedCity = ck;
             setCapturedCityKey(ck);
-            return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true);
+            return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap, destroyedUnits: newDestroyedUnits }, true);
           } else {
             shouldMove = false;
             setMessage(`City attack failed. ${unit.strength} strength remaining.`);
           }
-          
-          if (unit.strength <= 0) { 
+
+          if (unit.strength <= 0) {
             newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
             unitDestroyed = true; // BUG #10 FIX
-            setMessage('Your unit was destroyed!'); 
-            return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
+            setMessage('Your unit was destroyed!');
+            return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap, destroyedUnits: newDestroyedUnits }, true); 
           }
         } else {
           // Unit combat
@@ -1031,9 +1045,16 @@ export default function StrategicConquestGame() {
               }
             });
             
-            const result = resolveCombat(unit, defender, newUnits); 
+            const atkStrBefore = unit.strength;
+            const result = resolveCombat(unit, defender, newUnits);
             unit.strength = result.attRem;
-            
+
+            // Record combat stats (before filtering dead units out)
+            { const sr = recordCombatStats(newUnits, newDestroyedUnits, unit.id, defender.id, atkStrBefore, defender.strength, result.attRem, result.defRem, prev.turn);
+              newUnits = sr.units; newDestroyedUnits = sr.destroyedUnits;
+              const updAtk = newUnits.find(u => u.id === unit.id);
+              if (updAtk) { unit.combatStats = updAtk.combatStats; unit.damagedBy = updAtk.damagedBy; } }
+
             if (result.defDead) {
               // Remove defender and any cargo it was carrying
               newUnits = newUnits.filter(u => u.id !== defender.id && u.aboardId !== defender.id);
@@ -1057,18 +1078,23 @@ export default function StrategicConquestGame() {
                   if (!isFriendlyCity) {
                     shouldMove = false;
                   }
+                } else if (spec.isLand && targetTile === WATER) {
+                  // Land units can attack naval units on water but cannot advance onto water
+                  shouldMove = false;
                 } else if (spec.isLand && targetCity && !isFriendlyCity) {
                   // Land units must explicitly attack a hostile city — killing a
                   // unit garrisoned there does not auto-capture it
                   shouldMove = false;
                 }
               }
-            } else { 
+            } else {
               shouldMove = false;
               // Update defender in place
               const defIdx = newUnits.findIndex(u => u.id === defender.id);
               if (defIdx !== -1) {
-                newUnits[defIdx] = { ...newUnits[defIdx], strength: result.defRem };
+                // Sub ambush: defender sub reveals itself when firing torpedoes
+                const defFiredTorpedoes = UNIT_SPECS[defender.type].stealth;
+                newUnits[defIdx] = { ...newUnits[defIdx], strength: result.defRem, ...(defFiredTorpedoes ? { revealed: true } : {}) };
               }
               if (result.defDmg > 0) {
                 setMessage(`Enemy ${UNIT_SPECS[defender.type].name} damaged (${result.defRem} remaining).`);
@@ -1081,22 +1107,23 @@ export default function StrategicConquestGame() {
               newUnits = newUnits.filter(u => u.id !== unit.id && u.aboardId !== unit.id);
               unitDestroyed = true; // BUG #10 FIX
               setMessage('Your unit was destroyed!');
-              return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
+              return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap, destroyedUnits: newDestroyedUnits }, true);
             }
           }
         }
-        
-        // BUG #6 FIX: Multi-attack rules
-        // - First attack costs 1 move (for units with 2+ moves)
-        // - Second attack (or any attack when already moved/attacked) consumes ALL remaining moves
-        const hasAlreadyActed = unit.movesLeft < spec.movement;
-        
-        if (!hasAlreadyActed && unit.movesLeft > 1) {
-          // First action of turn with 2+ moves - just deduct 1 move
+
+        // Submarine reveals itself when firing torpedoes
+        if (spec.stealth) unit.revealed = true;
+
+        // Multi-attack rules: each attack costs 1 move; second attack exhausts all remaining.
+        // Uses hasAttacked flag so moving before attacking doesn't count as "already acted".
+        if (!unit.hasAttacked && unit.movesLeft > 1) {
+          // First attack of turn with 2+ moves remaining - deduct 1 move
           unit.movesLeft -= 1;
+          unit.hasAttacked = true;
         } else {
-          // Second attack OR first attack with only 1 move - consume all moves
-          unit.movesLeft = 0; 
+          // Second attack OR first attack with only 1 move left - consume all moves
+          unit.movesLeft = 0;
           unit.status = STATUS_USED;
         }
       }
@@ -1152,6 +1179,11 @@ export default function StrategicConquestGame() {
 
           unit.x = move.x;
           unit.y = move.y;
+          // Update facing direction (east/west) based on horizontal movement
+          if (move.x < startX) unit.facing = 'W';
+          else if (move.x > startX) unit.facing = 'E';
+          // Sub clears revealed state when it moves to a new tile
+          if (spec.stealth && (move.x !== startX || move.y !== startY)) unit.revealed = false;
           if (!move.isAttack) {
             unit.movesLeft--;
           }
@@ -1299,9 +1331,9 @@ export default function StrategicConquestGame() {
         if (statusIdx !== -1) {
           newUnits[statusIdx] = unit;
         }
-        return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap }, true); 
+        return advanceToNextUnit({ ...prev, units: newUnits, cities: newCities, map: newMap, destroyedUnits: newDestroyedUnits }, true);
       }
-      return { ...prev, units: newUnits, cities: newCities, map: newMap };
+      return { ...prev, units: newUnits, cities: newCities, map: newMap, destroyedUnits: newDestroyedUnits };
     });
   }, [activeUnit, gameState, validMoves, advanceToNextUnit]);
   
@@ -1323,18 +1355,24 @@ export default function StrategicConquestGame() {
     // Update AI knowledge (outside setGameState)
     setAiKnowledge(aiResult.knowledge);
     
-    // Store observations and combat events for display (outside setGameState)
+    // Store observations, combat events, and contact events for display
     const hasObservations = aiResult.observations && aiResult.observations.length > 0;
     const hasCombatEvents = aiResult.combatEvents && aiResult.combatEvents.length > 0;
-    
-    if (hasObservations || hasCombatEvents) {
-      console.log(`[Main] ${aiResult.observations?.length || 0} enemy movements observed, ${aiResult.combatEvents?.length || 0} combat events`);
+    const hasContactEvents = aiResult.contactEvents && aiResult.contactEvents.length > 0;
+
+    const hasDeclaration = !!aiResult.declarationOfWar;
+    if (hasObservations || hasCombatEvents || hasContactEvents || hasDeclaration) {
+      console.log(`[Main] ${aiResult.observations?.length || 0} movements, ${aiResult.combatEvents?.length || 0} combat, ${aiResult.contactEvents?.length || 0} contact events, war=${hasDeclaration}`);
       setAiObservations(aiResult.observations || []);
       setAiCombatEvents(aiResult.combatEvents || []);
+      setAiContactEvents(aiResult.contactEvents || []);
+      setAiDeclarationOfWar(hasDeclaration);
       setShowAiSummary(true);
     } else {
       setAiObservations([]);
       setAiCombatEvents([]);
+      setAiContactEvents([]);
+      setAiDeclarationOfWar(false);
     }
     
     // Reset player contact and observations for next turn
@@ -1491,6 +1529,7 @@ export default function StrategicConquestGame() {
       
       const key = e.key.toLowerCase(), numKey = parseInt(e.key);
       if (DIRECTIONS[numKey]) { const { dx, dy } = DIRECTIONS[numKey]; handleMove(dx, dy); return; }
+      if (numKey === 5 && activeUnit) { centerOnUnit(activeUnit); return; }
       switch (key) {
         case 'w': if (activeUnit) setGameState(prev => { const i = prev.units.findIndex(u => u.id === activeUnit.id); const nu = [...prev.units]; nu[i] = { ...nu[i], status: STATUS_WAITING, gotoPath: null, patrolPath: null }; return advanceToNextUnit({ ...prev, units: nu }, true); }); break;
         case 'k': if (activeUnit) setGameState(prev => { const i = prev.units.findIndex(u => u.id === activeUnit.id); const nu = [...prev.units]; nu[i] = { ...nu[i], status: STATUS_SKIPPED, gotoPath: null, patrolPath: null }; return advanceToNextUnit({ ...prev, units: nu }, true); }); break;
@@ -1852,10 +1891,26 @@ export default function StrategicConquestGame() {
           style={{ position: 'relative', width: VIEWPORT_TILES_X * TILE_WIDTH, height: VIEWPORT_TILES_Y * TILE_HEIGHT, overflow: 'hidden', border: `2px solid ${COLORS.border}` }}
           onMouseLeave={() => setMouseTile(null)}
         >
-          {Array.from({ length: VIEWPORT_TILES_Y }).flatMap((_, vy) => Array.from({ length: VIEWPORT_TILES_X }).map((_, vx) => {
+          {(() => {
+            // Pre-compute sub detectors once for stealth-suppression in move highlights
+            const subDetectors = gameState.units.filter(u =>
+              u.owner === 'player' && !u.aboardId && UNIT_SPECS[u.type]?.detectsSubs
+            );
+            return Array.from({ length: VIEWPORT_TILES_Y }).flatMap((_, vy) => Array.from({ length: VIEWPORT_TILES_X }).map((_, vx) => {
             const x = viewportX + vx, y = viewportY + vy;
             if (x >= gameState.width || y >= gameState.height) return null;
-            const isValid = validMoves.some(m => m.x === x && m.y === y), isAttack = validMoves.some(m => m.x === x && m.y === y && m.isAttack);
+            const isValid = validMoves.some(m => m.x === x && m.y === y);
+            // Suppress red attack highlight if all enemies at this tile are undetected stealth subs
+            const isAttack = validMoves.some(m => {
+              if (!m.isAttack || m.x !== x || m.y !== y) return false;
+              if (m.isCity) return true; // city attacks always show red
+              const enemies = gameState.units.filter(u => u.x === x && u.y === y && u.owner !== 'player' && !u.aboardId);
+              return enemies.some(u => {
+                if (!UNIT_SPECS[u.type]?.stealth) return true;
+                if (u.revealed) return true; // revealed sub is a valid attack target
+                return subDetectors.some(d => Math.abs(d.x - u.x) <= 1 && Math.abs(d.y - u.y) <= 1);
+              });
+            });
             // NEW: Check if this is a valid bombard target
             const isBombardTarget = bombardMode && bombardTargets.some(t => t.x === x && t.y === y);
             return (
@@ -1873,7 +1928,8 @@ export default function StrategicConquestGame() {
                 style={{ position: 'absolute', left: vx * TILE_WIDTH, top: vy * TILE_HEIGHT }} 
               />
             );
-          }))}
+          }))
+          })()}
           {(() => {
             // Friendly units with sub-detection capability (for stealth filtering)
             const subDetectors = gameState.units.filter(u =>
@@ -1886,8 +1942,9 @@ export default function StrategicConquestGame() {
                 if (u.y < viewportY || u.y >= viewportY + VIEWPORT_TILES_Y) return false;
                 if (u.owner === 'player') return true; // always show own units
                 if (fog[u.y]?.[u.x] !== FOG_VISIBLE) return false;
-                // Enemy subs are stealthy: only visible when a friendly detector is adjacent
+                // Enemy subs are stealthy: only visible when a friendly detector is adjacent, or when revealed
                 if (UNIT_SPECS[u.type]?.stealth) {
+                  if (u.revealed) return true;
                   return subDetectors.some(d => Math.abs(d.x - u.x) <= 1 && Math.abs(d.y - u.y) <= 1);
                 }
                 return true;
@@ -2020,13 +2077,16 @@ export default function StrategicConquestGame() {
       {showCityDialog && <CityProductionDialog city={gameState.cities[showCityDialog]} cityKey={showCityDialog} map={gameState.map} width={gameState.width} height={gameState.height} units={gameState.units} fogArray={fog} onClose={() => setShowCityDialog(null)} onSetProduction={handleSetProduction} onMakeActive={handleMakeActive} />}
       {showUnitView && <UnitViewDialog x={showUnitView.x} y={showUnitView.y} map={gameState.map} width={gameState.width} height={gameState.height} units={gameState.units} fogArray={fog} onClose={() => setShowUnitView(null)} onMakeActive={handleMakeActive} />}
       {showCityList && <CityListDialog cities={gameState.cities} units={gameState.units} onClose={() => setShowCityList(false)} onSelectCity={handleSelectCity} />}
-      {showAllUnits && <AllUnitsListDialog units={gameState.units} map={gameState.map} width={gameState.width} height={gameState.height} fogArray={fog} onClose={() => setShowAllUnits(false)} onSelectUnit={handleSelectUnit} onMakeActive={handleMakeActive} />}
+      {showAllUnits && <AllUnitsListDialog units={gameState.units} destroyedUnits={gameState.destroyedUnits} map={gameState.map} width={gameState.width} height={gameState.height} fogArray={fog} onClose={() => setShowAllUnits(false)} onSelectUnit={handleSelectUnit} onMakeActive={handleMakeActive} onShowCombatTracker={() => { setShowAllUnits(false); setShowCombatTracker(true); }} />}
+      {showCombatTracker && <CombatTrackerDialog units={gameState.units} destroyedUnits={gameState.destroyedUnits} onClose={() => setShowCombatTracker(false)} />}
       {showPatrolConfirm && <PatrolConfirmDialog waypoints={patrolWaypoints} segmentDistances={patrolDistances} onConfirm={handleConfirmPatrol} onCancel={() => { setShowPatrolConfirm(false); setPatrolMode(false); setPatrolWaypoints([]); setPatrolDistances(null); }} />}
-      {showAiSummary && (aiObservations.length > 0 || aiCombatEvents.length > 0) && (
-        <AITurnSummaryDialog 
+      {showAiSummary && (aiObservations.length > 0 || aiCombatEvents.length > 0 || aiContactEvents.length > 0 || aiDeclarationOfWar) && (
+        <AITurnSummaryDialog
           observations={aiObservations}
           combatEvents={aiCombatEvents}
-          onContinue={() => setShowAiSummary(false)}
+          contactEvents={aiContactEvents}
+          declarationOfWar={aiDeclarationOfWar}
+          onContinue={() => { setShowAiSummary(false); setAiDeclarationOfWar(false); }}
           onCenterOn={(pos) => {
             setViewportX(Math.max(0, Math.min(gameState.width - VIEWPORT_TILES_X, pos.x - Math.floor(VIEWPORT_TILES_X / 2))));
             setViewportY(Math.max(0, Math.min(gameState.height - VIEWPORT_TILES_Y, pos.y - Math.floor(VIEWPORT_TILES_Y / 2))));

@@ -379,7 +379,6 @@ function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCitie
         missions.set(fighter.id, {
           mission: { type: 'explore_island_interior', target: closest.target, priority: 8, assignedBy: 'exploration', reason: `island#${island.id} interior` }
         });
-        logMission(`fighter#${fighter.id}: island#${island.id} interior (rt=${closest.roundTripFuel})`);
         assignedIsland = true;
         break;
       }
@@ -397,7 +396,6 @@ function assignFighterMissions(fighters, state, knowledge, refuelPoints, aiCitie
       missions.set(fighter.id, {
         mission: { type: 'explore_sector', target: { x: target.x, y: target.y }, priority: 6, assignedBy: 'exploration', reason: `spoke-${dir.name} from (${base.x},${base.y})` }
       });
-      logMission(`fighter#${fighter.id}: spoke-${dir.name} (${base.x},${base.y})→(${target.x},${target.y})`);
       continue;
     }
 
@@ -483,6 +481,21 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
   // This ensures exactly 1 tank gets garrison duty per city, extras get other missions.
   const garrisonedCities = new Set();
 
+  // LAND phase: pre-count tanks already staged at transport-building cities so we
+  // can rally additional tanks there. Target: 3 per in-production transport so the
+  // first voyage departs loaded rather than empty.
+  const TRANSPORT_STAGING_TARGET = 3;
+  const transportStagingCounts = new Map();
+  if (phase === PHASE.LAND) {
+    for (const [key, city] of Object.entries(state.cities)) {
+      if (city.owner !== 'ai' || city.producing !== 'transport') continue;
+      const staged = state.units.filter(u =>
+        u.owner === 'ai' && u.type === 'tank' && u.x === city.x && u.y === city.y
+      ).length;
+      transportStagingCounts.set(key, staged);
+    }
+  }
+
   for (const { tank, reachable, reachableNeutral, reachablePlayer } of tanksByDistance) {
     // ===== P0: Hold tanks that are staging in a city building a transport =====
     // If the tank is sitting in an AI city that's currently producing a transport,
@@ -546,6 +559,26 @@ function assignTankMissions(tanks, state, knowledge, phase, aiCities, knownNeutr
     // Every tank should be pushing outward to discover and capture cities.
     // =========================================================================
     if (phase === PHASE.LAND) {
+      // ===== P0.5: Rally tanks to transport-building city =====
+      // Ensures the transport doesn't sail empty on its first voyage.
+      // Only kicks in when staging count is below target and this tank can reach the city.
+      if (transportStagingCounts.size > 0) {
+        let rallied = false;
+        for (const [tcKey, staged] of transportStagingCounts) {
+          if (staged >= TRANSPORT_STAGING_TARGET) continue;
+          const [tx, ty] = tcKey.split(',').map(Number);
+          if (tank.x === tx && tank.y === ty) continue; // P0 already holds tanks here
+          if (!reachable.has(tcKey)) continue;
+          missions.set(tank.id, {
+            mission: { type: 'stage_for_transport', target: { x: tx, y: ty }, priority: 6, assignedBy: 'exploration', reason: 'rally_to_transport' }
+          });
+          transportStagingCounts.set(tcKey, staged + 1);
+          rallied = true;
+          break;
+        }
+        if (rallied) continue;
+      }
+
       // Find the best explore target — coastal frontier first (traces island outline,
       // reveals more per step), then nearest unexplored land, then direct reachable scan.
       let exploreTarget = null;
@@ -803,176 +836,231 @@ function findNearestCoastToCity(city, state, knowledge) {
 function assignTransportMissions(transports, state, knowledge, knownNeutral, knownPlayer, claimedCities, claimedPickupCities, missions, turnLog) {
   const activeMissions = knowledge.activeMissions || {};
 
+  // ===== PHASE 1: Lock active deliveries =====
+  // A transport with cargo on a valid ferry_invasion keeps its mission — never interrupted.
+  // "Valid" means: has a targetKey, and the city is not yet AI-owned.
+  const lockedTransports = new Set();
   for (const transport of transports) {
+    const cargo = state.units.filter(u => u.aboardId === transport.id);
+    const prevMission = activeMissions[transport.id];
+    if (cargo.length > 0 && prevMission?.type === 'ferry_invasion' && prevMission.targetKey) {
+      const targetCity = state.cities[prevMission.targetKey];
+      if (targetCity && targetCity.owner !== 'ai') {
+        claimedCities.add(prevMission.targetKey);
+        missions.set(transport.id, { mission: prevMission });
+        lockedTransports.add(transport.id);
+      }
+    }
+  }
+
+  // Remaining transports available for city assignment or free use
+  const available = transports.filter(t => !lockedTransports.has(t.id));
+
+  // ===== PHASE 2: City coverage — city-first assignment =====
+  // For each unclaimed target city, assign the nearest available transport.
+  // Neutral cities have priority over player cities.
+  const sortedCities = [
+    ...knownNeutral.filter(c => !claimedCities.has(`${c.x},${c.y}`)),
+    ...knownPlayer.filter(c => !claimedCities.has(`${c.x},${c.y}`))
+  ];
+
+  const assignedInPhase2 = new Set(); // transport IDs committed in this phase
+
+  for (const city of sortedCities) {
+    const cityKey = `${city.x},${city.y}`;
+    if (claimedCities.has(cityKey)) continue;
+
+    // Find nearest available transport (not yet committed in phase 2)
+    let bestTransport = null;
+    let bestDist = Infinity;
+    for (const t of available) {
+      if (assignedInPhase2.has(t.id)) continue;
+      const d = manhattanDistance(t.x, t.y, city.x, city.y);
+      if (d < bestDist) { bestDist = d; bestTransport = t; }
+    }
+    if (!bestTransport) break; // No transports left to assign
+
+    claimedCities.add(cityKey);
+    assignedInPhase2.add(bestTransport.id);
+    const cargo = state.units.filter(u => u.aboardId === bestTransport.id);
+
+    if (cargo.length > 0) {
+      // Loaded transport — ferry directly to this city
+      const landing = findLandingTarget(city, state, knowledge);
+      if (landing) {
+        missions.set(bestTransport.id, {
+          mission: {
+            type: 'ferry_invasion',
+            target: landing.water,
+            targetKey: cityKey,
+            landingType: landing.type,
+            priority: 8,
+            assignedBy: 'exploration',
+            reason: `ferry to city (${city.x},${city.y})`
+          }
+        });
+      }
+    } else {
+      // Empty transport — go pick up tanks, then next turn will get ferry_invasion
+      const pickupResult = findPickupCity(bestTransport, state, claimedPickupCities);
+      if (pickupResult) {
+        claimedPickupCities.add(pickupResult.cityKey);
+        missions.set(bestTransport.id, {
+          mission: {
+            type: 'transport_pickup',
+            target: pickupResult.water,
+            pickupCity: pickupResult.cityKey,
+            priority: 6,
+            assignedBy: 'exploration',
+            reason: `pickup for city (${city.x},${city.y})`
+          }
+        });
+      } else {
+        // No tanks to load — rendezvous at nearest coastal AI city to wait
+        const rendezvous = findRendezvousTarget(bestTransport, state);
+        if (rendezvous) {
+          missions.set(bestTransport.id, {
+            mission: { type: 'transport_rendezvous', target: rendezvous, priority: 4, assignedBy: 'exploration', reason: `rendezvous for city (${city.x},${city.y})` }
+          });
+        } else {
+          const waterTarget = findBestExploreTarget(bestTransport, state, knowledge, 'water');
+          missions.set(bestTransport.id, {
+            mission: waterTarget
+              ? { type: 'explore_sector', target: waterTarget, priority: 2, assignedBy: 'exploration', reason: 'transport_explore_empty_phase2' }
+              : { type: 'wait', reason: 'transport_no_pickup' }
+          });
+        }
+      }
+    }
+  }
+
+  // ===== PHASE 3: Remaining transports — no city assignment =====
+  for (const transport of available) {
+    if (assignedInPhase2.has(transport.id)) continue;
+
     const cargo = state.units.filter(u => u.aboardId === transport.id);
     const prevMission = activeMissions[transport.id];
 
     if (cargo.length > 0) {
-      // HAS CARGO — check if previous ferry_invasion mission is still valid
-      if (prevMission?.type === 'ferry_invasion' && prevMission.targetKey) {
-        const targetCity = state.cities[prevMission.targetKey];
-        const alreadyCaptured = targetCity?.owner === 'ai';
-        const claimedByOther = claimedCities.has(prevMission.targetKey);
-        if (!alreadyCaptured && !claimedByOther) {
-          // Keep the existing mission — don't change destination mid-voyage
-          claimedCities.add(prevMission.targetKey);
-          missions.set(transport.id, { mission: prevMission });
-          continue;
-        }
-      }
-
-      // No valid persisted mission — find best destination (neutral city preferred, then player city)
-      const destinations = [...knownNeutral, ...knownPlayer];
-      let assigned = false;
-
-      // Sort by distance to transport
-      const sorted = destinations
-        .map(c => ({ ...c, dist: manhattanDistance(transport.x, transport.y, c.x, c.y) }))
-        .sort((a, b) => a.dist - b.dist);
-
-      for (const dest of sorted) {
-        const key = `${dest.x},${dest.y}`;
-        if (claimedCities.has(key)) continue;
-
-        // Strategy 1: Find adjacent water tile to land at (coastal city)
-        let targetWater = null;
-        for (const [dx, dy] of ALL_DIRS) {
-          const nx = dest.x + dx, ny = dest.y + dy;
-          if (state.map[ny]?.[nx] === WATER) {
-            targetWater = { x: nx, y: ny };
-            break;
-          }
-        }
-
-        if (targetWater) {
-          claimedCities.add(key);
-          missions.set(transport.id, {
-            mission: {
-              type: 'ferry_invasion',
-              target: targetWater,
-              targetKey: key,
-              priority: 8,
-              assignedBy: 'exploration',
-              reason: `ferry to city (${dest.x},${dest.y})`
-            }
-          });
-          assigned = true;
-          break;
-        }
-
-        // Strategy 2: City is landlocked - find nearest coast tile on the same island
-        // so transport can unload tanks who walk overland to capture it
-        const nearestCoast = findNearestCoastToCity(dest, state, knowledge);
-        if (nearestCoast) {
-          claimedCities.add(key);
-          missions.set(transport.id, {
-            mission: {
-              type: 'ferry_invasion',
-              target: nearestCoast,
-              targetKey: key,
-              landingType: 'coastal_march',  // Flag: tanks must march overland
-              priority: 7,
-              assignedBy: 'exploration',
-              reason: `ferry to coast near landlocked city (${dest.x},${dest.y})`
-            }
-          });
-          logExplore(`Transport#${transport.id}: landlocked city (${dest.x},${dest.y}), landing at coast (${nearestCoast.x},${nearestCoast.y})`);
-          assigned = true;
-          break;
-        }
-      }
-
-      if (!assigned) {
-        // No target city - explore water to find new islands
-        const waterTarget = findBestExploreTarget(transport, state, knowledge, 'water');
-        if (waterTarget) {
-          missions.set(transport.id, {
-            mission: {
-              type: 'explore_sector',
-              target: waterTarget,
-              priority: 3,
-              assignedBy: 'exploration',
-              reason: 'transport_explore_with_cargo'
-            }
-          });
-        }
+      // Loaded but no city to deliver to — explore with cargo to find new islands
+      const waterTarget = findBestExploreTarget(transport, state, knowledge, 'water');
+      if (waterTarget) {
+        missions.set(transport.id, {
+          mission: { type: 'explore_sector', target: waterTarget, priority: 3, assignedBy: 'exploration', reason: 'transport_explore_with_cargo' }
+        });
       }
     } else {
-      // NO CARGO — check if previous transport_pickup mission is still valid (en route, tanks still there)
+      // No cargo — check if persisted pickup mission is still valid
       if (prevMission?.type === 'transport_pickup' && prevMission.pickupCity) {
         const [pcx, pcy] = prevMission.pickupCity.split(',').map(Number);
         const atPickup = manhattanDistance(transport.x, transport.y, pcx, pcy) <= 1;
-        const city = state.cities[prevMission.pickupCity];
+        const pcity = state.cities[prevMission.pickupCity];
         const tanksStillThere = state.units.some(u =>
           u.x === pcx && u.y === pcy && u.type === 'tank' && u.owner === 'ai' && !u.aboardId
         );
-        const claimedByOther = claimedPickupCities.has(prevMission.pickupCity);
-        // Keep mission if: not yet at pickup city AND tanks still waiting AND not claimed by another transport
-        if (!atPickup && tanksStillThere && !claimedByOther && city?.owner === 'ai') {
+        if (!atPickup && tanksStillThere && !claimedPickupCities.has(prevMission.pickupCity) && pcity?.owner === 'ai') {
           claimedPickupCities.add(prevMission.pickupCity);
           missions.set(transport.id, { mission: prevMission });
           continue;
         }
       }
 
-      // No valid persisted pickup mission — find best pickup from coastal cities
-      const aiCities = Object.values(state.cities).filter(c => c.owner === 'ai');
-      let assigned = false;
-
-      // Sort cities by number of waiting tanks (prefer larger groups)
-      const pickupCities = [];
-      for (const city of aiCities) {
-        if (!isAdjacentToWater(city.x, city.y, state.map, state.map[0].length, state.map.length)) continue;
-        const cityKey = `${city.x},${city.y}`;
-        // Don't race another transport already headed to this city
-        if (claimedPickupCities.has(cityKey)) continue;
-        const tanksHere = state.units.filter(u =>
-          u.x === city.x && u.y === city.y && u.type === 'tank' && u.owner === 'ai' && !u.aboardId
-        );
-        if (tanksHere.length === 0) continue;
-        // Don't steal from a city that's building its own transport (unless it has < 2 tanks
-        // waiting — too few to fill a load, so help out)
-        if (city.producing === 'transport' && tanksHere.length >= 2) {
-          // Check if the transport being built here isn't already near completion
-          const spec = { productionDays: 10 }; // transport days
-          const progress = city.progress?.transport || 0;
-          const turnsLeft = spec.productionDays - progress;
-          // If the transport will be ready within 5 turns, let those tanks wait for it
-          if (turnsLeft <= 5) continue;
-        }
-        pickupCities.push({ city, cityKey, tankCount: tanksHere.length });
-      }
-      // Prefer cities with more tanks (fill transport efficiently)
-      pickupCities.sort((a, b) => b.tankCount - a.tankCount);
-
-      for (const { city, cityKey } of pickupCities) {
-        // Find adjacent water tile
-        for (const [dx, dy] of ALL_DIRS) {
-          const nx = city.x + dx, ny = city.y + dy;
-          if (state.map[ny]?.[nx] === WATER) {
-            claimedPickupCities.add(cityKey);
-            missions.set(transport.id, {
-              mission: {
-                type: 'transport_pickup',
-                target: { x: nx, y: ny },
-                pickupCity: cityKey,
-                priority: 6,
-                assignedBy: 'exploration',
-                reason: `pickup tanks at (${city.x},${city.y})`
-              }
-            });
-            assigned = true;
-            break;
+      // Find best pickup (prefer cities with more tanks)
+      const pickupResult = findPickupCity(transport, state, claimedPickupCities);
+      if (pickupResult) {
+        claimedPickupCities.add(pickupResult.cityKey);
+        missions.set(transport.id, {
+          mission: {
+            type: 'transport_pickup',
+            target: pickupResult.water,
+            pickupCity: pickupResult.cityKey,
+            priority: 6,
+            assignedBy: 'exploration',
+            reason: `pickup tanks at (${pickupResult.cityKey})`
           }
-        }
-        if (assigned) break;
+        });
+        continue;
       }
 
-      if (!assigned) {
-        missions.set(transport.id, { mission: { type: 'wait', reason: 'transport_no_cargo_no_tanks' } });
+      // No tanks staged — rendezvous or explore
+      const hasTargets = knownNeutral.length > 0 || knownPlayer.length > 0;
+      if (hasTargets) {
+        const rendezvous = findRendezvousTarget(transport, state);
+        if (rendezvous && (transport.x !== rendezvous.cx || transport.y !== rendezvous.cy)) {
+          missions.set(transport.id, {
+            mission: { type: 'transport_rendezvous', target: rendezvous, priority: 3, assignedBy: 'exploration', reason: `rendezvous at coast` }
+          });
+          continue;
+        }
       }
+
+      const waterTarget = findBestExploreTarget(transport, state, knowledge, 'water');
+      missions.set(transport.id, {
+        mission: waterTarget
+          ? { type: 'explore_sector', target: waterTarget, priority: 2, assignedBy: 'exploration', reason: 'transport_explore_empty' }
+          : { type: 'wait', reason: 'transport_no_targets' }
+      });
     }
   }
+}
+
+// Returns { water, type } for landing adjacent to a city, or null.
+function findLandingTarget(city, state, knowledge) {
+  for (const [dx, dy] of ALL_DIRS) {
+    const nx = city.x + dx, ny = city.y + dy;
+    if (state.map[ny]?.[nx] === WATER) return { water: { x: nx, y: ny }, type: 'direct' };
+  }
+  const coast = findNearestCoastToCity(city, state, knowledge);
+  if (coast) {
+    logExplore(`City (${city.x},${city.y}) landlocked, landing at (${coast.x},${coast.y})`);
+    return { water: coast, type: 'coastal_march' };
+  }
+  return null;
+}
+
+// Returns { water, cityKey } for the best pickup city, or null.
+// Prefers cities with more tanks (fills transport efficiently).
+// Skips cities claimed by another transport or whose local transport is nearly done.
+function findPickupCity(transport, state, claimedPickupCities) {
+  const pickupCities = [];
+  for (const [cityKey, city] of Object.entries(state.cities)) {
+    if (city.owner !== 'ai') continue;
+    if (!isAdjacentToWater(city.x, city.y, state.map, state.map[0].length, state.map.length)) continue;
+    if (claimedPickupCities.has(cityKey)) continue;
+    const tanksHere = state.units.filter(u =>
+      u.x === city.x && u.y === city.y && u.type === 'tank' && u.owner === 'ai' && !u.aboardId
+    );
+    if (tanksHere.length === 0) continue;
+    if (city.producing === 'transport' && tanksHere.length >= 2) {
+      const turnsLeft = 10 - (city.progress?.transport || 0);
+      if (turnsLeft <= 5) continue; // Let them wait for local transport
+    }
+    pickupCities.push({ city, cityKey, tankCount: tanksHere.length });
+  }
+  pickupCities.sort((a, b) => b.tankCount - a.tankCount);
+
+  for (const { city, cityKey } of pickupCities) {
+    for (const [dx, dy] of ALL_DIRS) {
+      const nx = city.x + dx, ny = city.y + dy;
+      if (state.map[ny]?.[nx] === WATER) return { water: { x: nx, y: ny }, cityKey };
+    }
+  }
+  return null;
+}
+
+// Returns a water tile adjacent to the nearest coastal AI city, or null.
+function findRendezvousTarget(transport, state) {
+  const coastalCities = Object.values(state.cities).filter(c =>
+    c.owner === 'ai' &&
+    isAdjacentToWater(c.x, c.y, state.map, state.map[0].length, state.map.length)
+  );
+  const nearest = findNearest(transport, coastalCities);
+  if (!nearest) return null;
+  for (const [dx, dy] of ALL_DIRS) {
+    const nx = nearest.x + dx, ny = nearest.y + dy;
+    if (state.map[ny]?.[nx] === WATER) return { x: nx, y: ny, cx: nearest.x, cy: nearest.y };
+  }
+  return null;
 }
 
 // ============================================================================

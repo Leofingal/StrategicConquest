@@ -66,7 +66,10 @@ export function createGameState(mapData, mapSize, terrain, difficulty) {
       gotoPath: null,
       patrolPath: null,
       patrolIdx: 0,
-      hasBombarded: false
+      hasBombarded: false,
+      hasAttacked: false,
+      combatStats: { damageDealt: 0, damageReceived: 0, kills: [], assists: [], productionValueDestroyed: 0 },
+      damagedBy: []
     },
     {
       id: 2,
@@ -82,10 +85,13 @@ export function createGameState(mapData, mapSize, terrain, difficulty) {
       gotoPath: null,
       patrolPath: null,
       patrolIdx: 0,
-      hasBombarded: false
+      hasBombarded: false,
+      hasAttacked: false,
+      combatStats: { damageDealt: 0, damageReceived: 0, kills: [], assists: [], productionValueDestroyed: 0 },
+      damagedBy: []
     }
   ];
-  
+
   return {
     map,
     width,
@@ -97,7 +103,8 @@ export function createGameState(mapData, mapSize, terrain, difficulty) {
     nextUnitId: 3,
     mapSize,
     terrain,
-    difficulty
+    difficulty,
+    destroyedUnits: []
   };
 }
 
@@ -224,6 +231,7 @@ export function endPlayerTurn(state) {
     
     // BOMBARD FIX: Reset bombardment flag
     unit.hasBombarded = false;
+    unit.hasAttacked = false;
     
     // BUG #8 FIX: Damaged naval units (half health or less) have reduced movement by 1
     if (spec.isNaval && unit.strength <= spec.strength / 2) {
@@ -309,7 +317,10 @@ export function endPlayerTurn(state) {
         gotoPath: null,
         patrolPath: null,
         patrolIdx: 0,
-        hasBombarded: false
+        hasBombarded: false,
+        hasAttacked: false,
+        combatStats: { damageDealt: 0, damageReceived: 0, kills: [], assists: [], productionValueDestroyed: 0 },
+        damagedBy: []
       });
       newCities[key] = { ...city, progress: { ...city.progress, [city.producing]: 0 } };
     } else {
@@ -451,4 +462,120 @@ export function createTestGameState(overrides = {}) {
     difficulty: 5
   };
   return { ...defaultState, ...overrides };
+}
+
+// ============================================================================
+// COMBAT STATISTICS TRACKING
+// ============================================================================
+
+/**
+ * Record the result of a combat exchange and update combatStats on all units.
+ * Must be called BEFORE dead units are filtered from the units array.
+ * Handles kills, assists, damage tracking, and moving dead units to destroyedUnits.
+ * Returns { units, destroyedUnits } with updated stats.
+ *
+ * @param {Array}  units          - current units array (will be shallow-copied)
+ * @param {Array}  destroyedUnits - current destroyedUnits array
+ * @param {number} atkId          - attacker unit id
+ * @param {number} defId          - defender unit id
+ * @param {number} atkStrBefore   - attacker strength before combat
+ * @param {number} defStrBefore   - defender strength before combat
+ * @param {number} atkStrAfter    - attacker remaining strength (0 = dead)
+ * @param {number} defStrAfter    - defender remaining strength (0 = dead)
+ * @param {number} turn           - current game turn
+ */
+export function recordCombatStats(units, destroyedUnits, atkId, defId, atkStrBefore, defStrBefore, atkStrAfter, defStrAfter, turn) {
+  units = [...units];
+  destroyedUnits = [...(destroyedUnits || [])];
+
+  const atkIdx = units.findIndex(u => u.id === atkId);
+  const defIdx = units.findIndex(u => u.id === defId);
+  if (atkIdx < 0 || defIdx < 0) return { units, destroyedUnits };
+
+  const attacker = units[atkIdx];
+  const defender = units[defIdx];
+  const atkSpec = UNIT_SPECS[attacker.type] || {};
+  const defSpec = UNIT_SPECS[defender.type] || {};
+
+  // Damage from each side's perspective
+  const atkDmgDealt = Math.max(0, defStrBefore - defStrAfter);   // attacker dealt to defender
+  const atkDmgRecv  = Math.max(0, atkStrBefore - atkStrAfter);   // attacker received
+
+  // Build updated stats objects (do not modify originals yet)
+  let newAtkStats = {
+    damageDealt:             (attacker.combatStats?.damageDealt || 0) + atkDmgDealt,
+    damageReceived:          (attacker.combatStats?.damageReceived || 0) + atkDmgRecv,
+    kills:                   [...(attacker.combatStats?.kills || [])],
+    assists:                 [...(attacker.combatStats?.assists || [])],
+    productionValueDestroyed: attacker.combatStats?.productionValueDestroyed || 0,
+  };
+  let newDefStats = {
+    damageDealt:             (defender.combatStats?.damageDealt || 0) + atkDmgRecv,  // defender's counterattack
+    damageReceived:          (defender.combatStats?.damageReceived || 0) + atkDmgDealt,
+    kills:                   [...(defender.combatStats?.kills || [])],
+    assists:                 [...(defender.combatStats?.assists || [])],
+    productionValueDestroyed: defender.combatStats?.productionValueDestroyed || 0,
+  };
+
+  // Track who has damaged each unit (for assist detection)
+  const defDamagedBy = [...(defender.damagedBy || [])];
+  if (atkDmgDealt > 0 && !defDamagedBy.includes(atkId)) defDamagedBy.push(atkId);
+
+  const atkDamagedBy = [...(attacker.damagedBy || [])];
+  if (atkDmgRecv > 0 && !atkDamagedBy.includes(defId)) atkDamagedBy.push(defId);
+
+  // Helper: compute kill entry including sunk cargo value
+  function killEntry(killedUnit, killedSpec) {
+    const cargo = units.filter(u => u.aboardId === killedUnit.id);
+    const cargoProdVal = cargo.reduce((s, u) => s + (UNIT_SPECS[u.type]?.productionDays || 0), 0);
+    const prodVal = (killedSpec.productionDays || 0) + cargoProdVal;
+    return { type: killedUnit.type, name: killedSpec.name, productionDays: prodVal, cargoCount: cargo.length, turn };
+  }
+
+  // Helper: give assists to units other than the killer that have damaged the killed unit
+  function applyAssists(damagedByList, killerId, killedType, killedName) {
+    for (const assisterId of damagedByList) {
+      if (assisterId === killerId) continue;
+      const aIdx = units.findIndex(u => u.id === assisterId);
+      if (aIdx < 0) continue;
+      const aStats = units[aIdx].combatStats || { damageDealt: 0, damageReceived: 0, kills: [], assists: [], productionValueDestroyed: 0 };
+      units[aIdx] = { ...units[aIdx], combatStats: { ...aStats, assists: [...aStats.assists, { type: killedType, name: killedName, turn }] } };
+    }
+  }
+
+  // Defender died → attacker gets the kill
+  if (defStrAfter <= 0) {
+    const entry = killEntry(defender, defSpec);
+    newAtkStats.kills.push(entry);
+    newAtkStats.productionValueDestroyed += entry.productionDays;
+    applyAssists(defDamagedBy, atkId, defender.type, defSpec.name);
+    // Push defender (+ cargo) to destroyedUnits
+    destroyedUnits.push({ ...defender, combatStats: newDefStats, damagedBy: defDamagedBy, destroyedTurn: turn });
+    for (const c of units.filter(u => u.aboardId === defender.id)) {
+      destroyedUnits.push({ ...c, destroyedTurn: turn });
+    }
+  }
+
+  // Attacker died → defender gets the kill
+  if (atkStrAfter <= 0) {
+    const entry = killEntry(attacker, atkSpec);
+    newDefStats.kills.push(entry);
+    newDefStats.productionValueDestroyed += entry.productionDays;
+    applyAssists(atkDamagedBy, defId, attacker.type, atkSpec.name);
+    // Push attacker (+ cargo) to destroyedUnits
+    destroyedUnits.push({ ...attacker, combatStats: newAtkStats, damagedBy: atkDamagedBy, destroyedTurn: turn });
+    for (const c of units.filter(u => u.aboardId === attacker.id)) {
+      destroyedUnits.push({ ...c, destroyedTurn: turn });
+    }
+  }
+
+  // Write back surviving units
+  if (atkStrAfter > 0) {
+    units[atkIdx] = { ...attacker, combatStats: newAtkStats, damagedBy: atkDamagedBy };
+  }
+  if (defStrAfter > 0) {
+    units[defIdx] = { ...defender, combatStats: newDefStats, damagedBy: defDamagedBy };
+  }
+
+  return { units, destroyedUnits };
 }

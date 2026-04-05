@@ -710,15 +710,17 @@ export function UnitViewDialog({
  * BUG #1 FIX: Now captures Enter key to activate selected unit
  * BUG #11 FIX: "Make Active Unit" button moved outside scrollable area
  */
-export function AllUnitsListDialog({ 
-  units, 
+export function AllUnitsListDialog({
+  units,
+  destroyedUnits,
   map,
   width,
   height,
   fogArray,
-  onClose, 
+  onClose,
   onSelectUnit,
-  onMakeActive
+  onMakeActive,
+  onShowCombatTracker
 }) {
   const [selUnit, setSelUnit] = useState(null);
   const [hoveredUnit, setHoveredUnit] = useState(null);
@@ -947,13 +949,28 @@ export function AllUnitsListDialog({
           >
             Make Active Unit
           </button>
-          <button 
-            onClick={onClose} 
-            style={{ 
-              padding: '8px 20px', 
-              backgroundColor: 'transparent', 
-              border: `1px solid ${COLORS.border}`, 
-              color: COLORS.text, 
+          {onShowCombatTracker && (
+            <button
+              onClick={onShowCombatTracker}
+              style={{
+                padding: '8px 16px',
+                fontSize: 11,
+                backgroundColor: COLORS.panelLight,
+                border: `1px solid ${COLORS.border}`,
+                color: COLORS.text,
+                cursor: 'pointer'
+              }}
+            >
+              Combat Stats
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            style={{
+              padding: '8px 20px',
+              backgroundColor: 'transparent',
+              border: `1px solid ${COLORS.border}`,
+              color: COLORS.text,
               cursor: 'pointer',
               fontSize: 11
             }}
@@ -1629,11 +1646,12 @@ export function SurrenderDialog({ message, onYes, onNo }) {
  * BUG #2: AI Turn Summary Dialog
  * Shows observed enemy movements at end of AI turn
  */
-export function AITurnSummaryDialog({ observations, combatEvents, onContinue, onCenterOn }) {
+export function AITurnSummaryDialog({ observations, combatEvents, contactEvents, declarationOfWar, onContinue, onCenterOn }) {
   const hasCombat = combatEvents && combatEvents.length > 0;
   const hasObservations = observations && observations.length > 0;
-  
-  if (!hasCombat && !hasObservations) return null;
+  const hasContact = contactEvents && contactEvents.length > 0;
+
+  if (!declarationOfWar && !hasCombat && !hasObservations && !hasContact) return null;
   
   // Handle keyboard - Enter/Space to continue
   const handleKeyDown = (e) => {
@@ -1683,6 +1701,25 @@ export function AITurnSummaryDialog({ observations, combatEvents, onContinue, on
           maxHeight: "60vh", 
           overflowY: "auto" 
         }}>
+          {/* Declaration of War */}
+          {declarationOfWar && (
+            <div style={{
+              marginBottom: 16,
+              padding: "14px 16px",
+              backgroundColor: "rgba(180, 0, 0, 0.25)",
+              border: "2px solid rgba(220, 50, 50, 0.7)",
+              borderRadius: 4,
+              textAlign: "center",
+            }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: COLORS.danger, letterSpacing: 1, marginBottom: 8, textTransform: "uppercase" }}>
+                Enemy General
+              </div>
+              <div style={{ fontSize: 13, color: "#fff", fontStyle: "italic", lineHeight: 1.5 }}>
+                "It appears this map is not large enough for both of us. Prepare for war!"
+              </div>
+            </div>
+          )}
+
           {/* Combat Events Section */}
           {hasCombat && (
             <>
@@ -1871,12 +1908,77 @@ export function AITurnSummaryDialog({ observations, combatEvents, onContinue, on
           ))}
             </>
           )}
+
+          {/* Contact / Phase Events Section */}
+          {hasContact && (
+            <>
+              {(hasCombat || hasObservations) && (
+                <div style={{ height: 1, backgroundColor: COLORS.border, margin: '10px 0' }} />
+              )}
+              {contactEvents.map((evt, idx) => {
+                if (evt.type === 'phase_change') {
+                  const phaseLabel = { naval_phase: 'Naval Warfare', late_game: 'Late Game', transition: 'Transition' };
+                  return (
+                    <div key={`contact-${idx}`} style={{
+                      padding: "10px 12px",
+                      marginBottom: 6,
+                      backgroundColor: "rgba(255, 180, 0, 0.15)",
+                      border: "1px solid rgba(255, 180, 0, 0.4)",
+                      borderRadius: 4,
+                      fontSize: 12,
+                      color: COLORS.highlight,
+                      fontWeight: 600,
+                    }}>
+                      ★ Enemy strategy shifted to {phaseLabel[evt.to] || evt.to} phase
+                    </div>
+                  );
+                }
+                if (evt.type === 'found_city') {
+                  return (
+                    <div key={`contact-${idx}`} style={{
+                      padding: "10px 12px",
+                      marginBottom: 6,
+                      backgroundColor: "rgba(200, 50, 50, 0.15)",
+                      border: "1px solid rgba(200, 50, 50, 0.4)",
+                      borderRadius: 4,
+                      fontSize: 12,
+                      color: "#fff",
+                      cursor: evt.x != null ? "pointer" : "default",
+                    }}
+                    onClick={() => evt.x != null && onCenterOn && onCenterOn({ x: evt.x, y: evt.y })}
+                    >
+                      ⚠ Enemy scout discovered your city{evt.x != null ? ` at (${evt.x}, ${evt.y})` : ''}
+                    </div>
+                  );
+                }
+                if (evt.type === 'found_unit') {
+                  return (
+                    <div key={`contact-${idx}`} style={{
+                      padding: "10px 12px",
+                      marginBottom: 6,
+                      backgroundColor: "rgba(200, 50, 50, 0.15)",
+                      border: "1px solid rgba(200, 50, 50, 0.4)",
+                      borderRadius: 4,
+                      fontSize: 12,
+                      color: "#fff",
+                      cursor: evt.x != null ? "pointer" : "default",
+                    }}
+                    onClick={() => evt.x != null && onCenterOn && onCenterOn({ x: evt.x, y: evt.y })}
+                    >
+                      ⚠ Enemy scout made contact with your {evt.unitType ? (UNIT_SPECS[evt.unitType]?.name || evt.unitType) : 'forces'}{evt.x != null ? ` at (${evt.x}, ${evt.y})` : ''}
+                    </div>
+                  );
+                }
+                return null;
+              })}
+            </>
+          )}
         </div>
-        <div style={{ 
-          padding: 12, 
-          borderTop: `1px solid ${COLORS.border}`, 
-          display: "flex", 
-          justifyContent: "center" 
+        <div style={{
+          padding: 12,
+          borderTop: `1px solid ${COLORS.border}`,
+          display: "flex",
+          justifyContent: "center"
         }}>
           <button 
             onClick={onContinue} 
@@ -2724,6 +2826,149 @@ export function HelpDialog({ title, guide, onClose }) {
         </div>
         <div style={{ padding: '8px 12px', borderTop: `1px solid ${COLORS.border}`, display: 'flex', justifyContent: 'flex-end' }}>
           <button onClick={onClose} style={btnStyle}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================================
+// COMBAT TRACKER DIALOG
+// ============================================================================
+
+/**
+ * Combat Tracker Dialog — per-unit combat efficiency stats.
+ * Shows damage dealt/received, kills, assists, and production value destroyed.
+ * Accessible via "Combat Stats" button in the All Units dialog.
+ */
+export function CombatTrackerDialog({ units, destroyedUnits = [], onClose }) {
+  const [filter, setFilter] = useState('all');   // 'all' | 'active' | 'destroyed'
+  const [selectedId, setSelectedId] = useState(null);
+
+  // Combine active and destroyed, player side only
+  const activePlayer  = units.filter(u => u.owner === 'player' && !u.aboardId);
+  const deadPlayer    = (destroyedUnits || []).filter(u => u.owner === 'player');
+
+  const rows = (filter === 'active'    ? activePlayer
+              : filter === 'destroyed' ? deadPlayer
+              : [...activePlayer, ...deadPlayer])
+    .sort((a, b) => (b.combatStats?.productionValueDestroyed || 0) - (a.combatStats?.productionValueDestroyed || 0));
+
+  const sel = rows.find(u => u.id === selectedId) || null;
+
+  const overlay = { position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.75)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1200 };
+  const panel   = { backgroundColor: COLORS.panel, border: `2px solid ${COLORS.border}`, display: 'flex', flexDirection: 'column', width: 780, maxHeight: '85vh', fontFamily: 'Monaco, monospace' };
+  const hdr     = { backgroundColor: COLORS.border, padding: '8px 12px', fontSize: 12, fontWeight: 600, letterSpacing: 1, textTransform: 'uppercase', display: 'flex', justifyContent: 'space-between', alignItems: 'center' };
+  const filterBtn = (val, label) => (
+    <button onClick={() => setFilter(val)} style={{ padding: '4px 10px', fontSize: 10, backgroundColor: filter === val ? COLORS.highlight : COLORS.panelLight, border: `1px solid ${COLORS.border}`, color: filter === val ? COLORS.textDark : COLORS.text, cursor: 'pointer', fontWeight: filter === val ? 700 : 400 }}>{label}</button>
+  );
+
+  const col = (w) => ({ width: w, minWidth: w, textAlign: 'right', paddingRight: 8, color: COLORS.text, fontSize: 10 });
+  const colL = (w) => ({ width: w, minWidth: w, textAlign: 'left', paddingRight: 8, color: COLORS.text, fontSize: 10 });
+
+  return (
+    <div style={overlay}>
+      <div style={panel}>
+        {/* Header */}
+        <div style={hdr}>
+          <span>Combat Statistics</span>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            {filterBtn('all', 'All')}
+            {filterBtn('active', 'Active')}
+            {filterBtn('destroyed', 'Destroyed')}
+            <button onClick={onClose} style={{ background: 'none', border: 'none', color: COLORS.textMuted, fontSize: 16, cursor: 'pointer', lineHeight: 1, marginLeft: 8 }}>&#x2715;</button>
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', flex: 1, minHeight: 0 }}>
+          {/* Unit list */}
+          <div style={{ width: 420, borderRight: `1px solid ${COLORS.border}`, display: 'flex', flexDirection: 'column' }}>
+            {/* Column headers */}
+            <div style={{ display: 'grid', gridTemplateColumns: '24px 90px 52px 52px 52px 52px 80px', alignItems: 'center', padding: '4px 6px', borderBottom: `1px solid ${COLORS.border}`, backgroundColor: COLORS.panelDark }}>
+              <span style={{ fontSize: 9, color: COLORS.textMuted }}></span>
+              <span style={{ fontSize: 9, color: COLORS.textMuted }}>UNIT</span>
+              <span style={{ fontSize: 9, color: COLORS.textMuted, textAlign: 'right', paddingRight: 8 }}>DEALT</span>
+              <span style={{ fontSize: 9, color: COLORS.textMuted, textAlign: 'right', paddingRight: 8 }}>RECV</span>
+              <span style={{ fontSize: 9, color: COLORS.textMuted, textAlign: 'right', paddingRight: 8 }}>KILLS</span>
+              <span style={{ fontSize: 9, color: COLORS.textMuted, textAlign: 'right', paddingRight: 8 }}>ASST</span>
+              <span style={{ fontSize: 9, color: COLORS.textMuted, textAlign: 'right', paddingRight: 8 }}>PROD VAL</span>
+            </div>
+            {/* Rows */}
+            <div style={{ overflowY: 'auto', flex: 1 }}>
+              {rows.length === 0 && <div style={{ padding: 16, color: COLORS.textMuted, fontSize: 11 }}>No units to display.</div>}
+              {rows.map(u => {
+                const cs = u.combatStats || {};
+                const isDead = !!u.destroyedTurn;
+                const isSelected = u.id === selectedId;
+                return (
+                  <div key={`${u.id}-${isDead}`} onClick={() => setSelectedId(isSelected ? null : u.id)}
+                    style={{ display: 'grid', gridTemplateColumns: '24px 90px 52px 52px 52px 52px 80px', alignItems: 'center', padding: '3px 6px', cursor: 'pointer', backgroundColor: isSelected ? COLORS.highlight : 'transparent', color: isSelected ? COLORS.textDark : isDead ? COLORS.textMuted : COLORS.text, borderBottom: `1px solid ${COLORS.panelLight}` }}>
+                    <MiniUnitIcon type={u.type} owner="player" size="tiny" />
+                    <span style={{ fontSize: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{UNIT_SPECS[u.type]?.name}{isDead ? ' †' : ''}</span>
+                    <span style={{ ...col(52), color: isSelected ? COLORS.textDark : (cs.damageDealt > 0 ? '#8f8' : COLORS.textMuted) }}>{cs.damageDealt || 0}</span>
+                    <span style={{ ...col(52), color: isSelected ? COLORS.textDark : (cs.damageReceived > 0 ? '#f88' : COLORS.textMuted) }}>{cs.damageReceived || 0}</span>
+                    <span style={{ ...col(52) }}>{cs.kills?.length || 0}</span>
+                    <span style={{ ...col(52) }}>{cs.assists?.length || 0}</span>
+                    <span style={{ ...col(80), fontWeight: (cs.productionValueDestroyed > 0) ? 700 : 400 }}>{cs.productionValueDestroyed || 0}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Detail pane */}
+          <div style={{ flex: 1, padding: 12, overflowY: 'auto', fontSize: 11, color: COLORS.text }}>
+            {!sel && <div style={{ color: COLORS.textMuted, marginTop: 8 }}>Select a unit to see details.</div>}
+            {sel && (() => {
+              const cs = sel.combatStats || {};
+              const isDead = !!sel.destroyedTurn;
+              return (
+                <>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+                    <MiniUnitIcon type={sel.type} owner="player" size="medium" />
+                    <div>
+                      <div style={{ fontWeight: 700, fontSize: 13 }}>{UNIT_SPECS[sel.type]?.name}{isDead ? ' (Destroyed)' : ''}</div>
+                      {isDead && <div style={{ fontSize: 10, color: COLORS.textMuted }}>Destroyed turn {sel.destroyedTurn}</div>}
+                    </div>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 16px', marginBottom: 12 }}>
+                    <div style={{ color: COLORS.textMuted, fontSize: 10 }}>Damage Dealt</div>      <div style={{ color: '#8f8', fontWeight: 600 }}>{cs.damageDealt || 0}</div>
+                    <div style={{ color: COLORS.textMuted, fontSize: 10 }}>Damage Received</div>   <div style={{ color: '#f88', fontWeight: 600 }}>{cs.damageReceived || 0}</div>
+                    <div style={{ color: COLORS.textMuted, fontSize: 10 }}>Kills</div>             <div style={{ fontWeight: 600 }}>{cs.kills?.length || 0}</div>
+                    <div style={{ color: COLORS.textMuted, fontSize: 10 }}>Assists</div>           <div style={{ fontWeight: 600 }}>{cs.assists?.length || 0}</div>
+                    <div style={{ color: COLORS.textMuted, fontSize: 10 }}>Prod. Value Destroyed</div> <div style={{ color: '#ff8', fontWeight: 700 }}>{cs.productionValueDestroyed || 0} days</div>
+                  </div>
+                  {cs.kills?.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.textMuted, marginBottom: 4, textTransform: 'uppercase', letterSpacing: 1 }}>Kills</div>
+                      {cs.kills.map((k, i) => (
+                        <div key={i} style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0', borderBottom: `1px solid ${COLORS.panelLight}`, fontSize: 10 }}>
+                          <span>{k.name}{k.cargoCount > 0 ? ` (+${k.cargoCount} cargo)` : ''}</span>
+                          <span style={{ color: COLORS.textMuted }}>{k.productionDays} days · T{k.turn}</span>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                  {cs.assists?.length > 0 && (
+                    <>
+                      <div style={{ fontSize: 10, fontWeight: 700, color: COLORS.textMuted, marginBottom: 4, marginTop: 10, textTransform: 'uppercase', letterSpacing: 1 }}>Assists</div>
+                      {cs.assists.map((a, i) => (
+                        <div key={i} style={{ padding: '2px 0', borderBottom: `1px solid ${COLORS.panelLight}`, fontSize: 10, display: 'flex', justifyContent: 'space-between' }}>
+                          <span>{a.name}</span>
+                          <span style={{ color: COLORS.textMuted }}>T{a.turn}</span>
+                        </div>
+                      ))}
+                    </>
+                  )}
+                </>
+              );
+            })()}
+          </div>
+        </div>
+
+        {/* Footer */}
+        <div style={{ padding: '8px 12px', borderTop: `1px solid ${COLORS.border}`, display: 'flex', justifyContent: 'flex-end' }}>
+          <button onClick={onClose} style={{ padding: '6px 20px', backgroundColor: 'transparent', border: `1px solid ${COLORS.border}`, color: COLORS.text, cursor: 'pointer', fontSize: 11 }}>Close</button>
         </div>
       </div>
     </div>

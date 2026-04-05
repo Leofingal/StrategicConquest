@@ -285,21 +285,24 @@ export function UnitSprite({
         overflow: 'hidden',
       }}
     >
-      {/* Unit sprite - either image or emoji */}
+      {/* Unit sprite - either image or emoji; mirror when facing west */}
       {sprite && sprite.type === 'image' ? (
-        <img 
-          src={spriteSrc} 
+        <img
+          src={spriteSrc}
           alt={spec.name}
-          style={{ 
+          style={{
             width: '100%',
             height: '100%',
             objectFit: 'contain',
             filter: inv ? 'invert(1)' : 'none',
             opacity: isAboard ? 0.7 : 1,
+            transform: unit.facing === 'W' ? 'scaleX(-1)' : 'none',
           }}
         />
       ) : (
-        sprite ? sprite.value : spec.icon
+        <span style={{ display: 'inline-block', transform: unit.facing === 'W' ? 'scaleX(-1)' : 'none' }}>
+          {sprite ? sprite.value : spec.icon}
+        </span>
       )}
       
       {/* Health indicator (bottom-right) */}

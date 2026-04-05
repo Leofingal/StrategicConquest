@@ -68,6 +68,9 @@ Write-Host ""
 Write-Host "Tip: Use the Claude Code panel (extension icon in sidebar) to chat." -ForegroundColor DarkGray
 Write-Host ""
 
+# Set Claude Code model
+$env:ANTHROPIC_MODEL = "claude-opus-4-6"
+
 # Launch Cursor
 if ($cursorExe -eq "cursor") {
     Start-Process -FilePath "cursor" -ArgumentList "`"$ProjectPath`""

@@ -43,18 +43,31 @@ export function planProduction(state, knowledge, turnLog, tickProgress = true) {
     if (unit.owner === 'ai') unitCounts[unit.type]++;
   }
 
-  // Add fractional for in-progress production (so we don't over-produce one type)
+  // Add fractional for in-progress production (so we don't over-produce one type).
+  // Floor of 0.2 for newly-assigned cities (progress=0) so the commitment signal
+  // doesn't drop to zero between the turn of assignment and the first tick.
   for (const city of Object.values(s.cities)) {
     if (city.owner !== 'ai' || !city.producing) continue;
     const spec = UNIT_SPECS[city.producing];
     if (!spec) continue;
     const progress = city.progress?.[city.producing] || 0;
-    if (progress > 0) {
-      unitCounts[city.producing] += progress / spec.productionDays;
-    }
+    const fraction = progress > 0 ? progress / spec.productionDays : 0.2;
+    unitCounts[city.producing] += fraction;
   }
 
   const totalUnits = Math.max(1, Object.values(unitCounts).reduce((a, b) => a + b, 0));
+
+  // Land phase, turn 8+: seed 1 fighter and 1 transport before normal selection.
+  // Each type is added once if it's neither in production nor already built.
+  // The queue is consumed in Step 2b — naval types wait for a coastal city.
+  const landPriorityQueue = [];
+  if (phase === PHASE.LAND && s.turn >= 8) {
+    for (const type of ['fighter', 'transport']) {
+      const inProd = Object.values(s.cities).some(c => c.owner === 'ai' && c.producing === type);
+      const exists = s.units.some(u => u.owner === 'ai' && u.type === type);
+      if (!inProd && !exists) landPriorityQueue.push(type);
+    }
+  }
 
   // Step 2: Process each AI city
   for (const [key, city] of Object.entries(s.cities)) {
@@ -89,7 +102,11 @@ export function planProduction(state, knowledge, turnLog, tickProgress = true) {
             aboardId: null,
             gotoPath: null,
             patrolPath: null,
-            patrolIdx: 0
+            patrolIdx: 0,
+            hasBombarded: false,
+            hasAttacked: false,
+            combatStats: { damageDealt: 0, damageReceived: 0, kills: [], assists: [], productionValueDestroyed: 0 },
+            damagedBy: []
           };
           s.units.push(newUnit);
           turnLog.push(`Built ${city.producing} at ${key}`);
@@ -115,7 +132,20 @@ export function planProduction(state, knowledge, turnLog, tickProgress = true) {
     // Step 2b: City is IDLE - assign new production
     const currentCity = s.cities[key];
     const isCoastal = isAdjacentToWater(city.x, city.y, s.map, s.map[0].length, s.map.length);
-    const bestType = pickBestProduction(unitCounts, totalUnits, targetDist, isCoastal, currentCity, key);
+
+    // Consume land-late priority queue (fighter / transport seed)
+    let bestType = null;
+    for (let i = 0; i < landPriorityQueue.length; i++) {
+      const pType = landPriorityQueue[i];
+      const spec = UNIT_SPECS[pType];
+      if (spec?.isNaval && !isCoastal) continue; // naval type needs a coastal city — skip for now
+      bestType = pType;
+      landPriorityQueue.splice(i, 1);
+      break;
+    }
+    if (!bestType) {
+      bestType = pickBestProduction(unitCounts, totalUnits, targetDist, isCoastal, currentCity, key);
+    }
 
     s.cities = { ...s.cities, [key]: { ...currentCity, producing: bestType } };
     logProd(`${key}: Starting ${bestType} (idle city)`);

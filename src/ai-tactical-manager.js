@@ -131,6 +131,50 @@ export function assignTacticalMissions(state, knowledge, units, threats, phase, 
     assignHuntMissions(unassigned, playerBattleships, claimedTargets, missions, 'hunt_battleship', 6);
   }
 
+  // ===== PRIORITY 3.5: Hunt Player Destroyers and Submarines =====
+  // Battleships dominate destroyers; unoccupied battleships/subs/destroyers pursue remaining naval threats
+  const playerNavalRest = threats.playerNavalCombat.filter(u =>
+    u.type === 'destroyer' || u.type === 'submarine'
+  );
+  if (playerNavalRest.length > 0) {
+    const unassigned = getUnassigned([...battleships, ...submarines, ...destroyers], missions);
+    assignHuntMissions(unassigned, playerNavalRest, claimedTargets, missions, 'hunt_naval', 5);
+  }
+
+  // ===== PRIORITY 3.8: Bomber Nuke Strike =====
+  // Bombers target the most densely occupied player city for maximum production value destroyed.
+  // Each bomber gets its own target; if there are more bombers than player cities, extras share
+  // the highest-value target.
+  const unassignedBombers = getUnassigned(bombers, missions);
+  if (unassignedBombers.length > 0) {
+    const playerCities = Object.entries(state.cities)
+      .filter(([, c]) => c.owner === 'player')
+      .map(([key, c]) => {
+        const [cx, cy] = key.split(',').map(Number);
+        const nearbyUnits = state.units.filter(u =>
+          u.owner === 'player' && manhattanDistance(u.x, u.y, cx, cy) <= 3
+        ).length;
+        return { x: cx, y: cy, score: nearbyUnits };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    for (let i = 0; i < unassignedBombers.length; i++) {
+      const target = playerCities[i] ?? playerCities[0]; // wrap if fewer cities than bombers
+      if (target) {
+        missions.set(unassignedBombers[i].id, {
+          mission: {
+            type: 'hunt_target',
+            target: { x: target.x, y: target.y },
+            priority: 7,
+            assignedBy: 'tactical',
+            reason: `nuke_strike (score=${target.score})`
+          }
+        });
+        logTactical(`bomber#${unassignedBombers[i].id} -> nuke_strike (${target.x},${target.y}) score=${target.score}`);
+      }
+    }
+  }
+
   // ===== PRIORITY 4: Defend Threatened Cities =====
   if (threats.threatenedCities.length > 0) {
     assignCityDefense(state, threats, fighters, destroyers, missions, turnLog);

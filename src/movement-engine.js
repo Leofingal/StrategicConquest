@@ -237,10 +237,17 @@ export function getValidMoves(unit, gameState) {
       
       // Only allow attack if there are valid targets
       if (validTargets.length > 0) {
-        // Land units can attack from transport (disembark attack)
+        // Land units can attack from transport (disembark attack on land; stay aboard for water)
         if (unit.aboardId && spec.isLand && tile !== WATER) {
           moves.push({ x: nx, y: ny, dir: parseInt(key), isAttack: true, disembark: true });
-        } 
+        }
+        // Land units aboard transport in a city can attack adjacent naval units on water (no disembark)
+        // (Transport in city = tank is on land; transport at sea = tank cannot fire out)
+        else if (unit.aboardId && spec.isLand && tile === WATER) {
+          if (gameState.cities[`${ux},${uy}`]) {
+            moves.push({ x: nx, y: ny, dir: parseInt(key), isAttack: true, disembark: false });
+          }
+        }
         // CARRIER FIX: Aircraft can attack from carrier (launch and attack)
         else if (unit.aboardId && spec.isAir) {
           moves.push({ x: nx, y: ny, dir: parseInt(key), isAttack: true, disembark: true });
